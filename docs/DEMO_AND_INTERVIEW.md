@@ -1,4 +1,4 @@
-# Live demo and SRE lead interview guide
+<!-- # Live demo and SRE lead interview guide
 
 ## 1. Suggested 5-7 minute live demo
 
@@ -97,4 +97,4 @@ Define the RTO/RPO and consistency requirements first. Decide if token validity/
 - Report the current results in [VALIDATION.md](VALIDATION.md); Compose and kind checks are runtime tests and
   should not be described as passing until they have actually completed.
 - Kubernetes HPAs need metrics-server. NetworkPolicies need a CNI that enforces them (kind's does). Access is by port-forward until an Ingress is added.
-- PostgreSQL and Redis HA is exercised by the kind end-to-end test. Backups and restore drills still need object storage and an agreed RPO/RTO.
+- PostgreSQL and Redis HA is exercised by the kind end-to-end test. Backups and restore drills still need object storage and an agreed RPO/RTO. -->
