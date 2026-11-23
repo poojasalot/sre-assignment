@@ -1,0 +1,11 @@
+.git
+.github
+**/__pycache__
+**/.pytest_cache
+**/.venv
+**/venv
+**/*.pyc
+.env
+.env.*
+!.env.example
+k8s/secrets.yaml

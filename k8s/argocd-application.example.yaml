@@ -1,0 +1,61 @@
+# Optional GitOps starting point. Create separate Applications to limit deployment blast radius.
+# Use environment overlays and controlled promotion in a real cluster.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: sre-token-dev
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/your-org/sre-token-platform.git
+    targetRevision: main
+    path: k8s/overlays/dev
+    kustomize:
+      buildOptions: --load-restrictor LoadRestrictionsNone
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: sre-platform-dev
+  syncPolicy:
+    automated: {prune: true, selfHeal: true}
+    syncOptions: [CreateNamespace=true]
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: sre-token-staging
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/your-org/sre-token-platform.git
+    targetRevision: main
+    path: k8s/overlays/staging
+    kustomize:
+      buildOptions: --load-restrictor LoadRestrictionsNone
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: sre-platform-staging
+  syncPolicy:
+    automated: {prune: true, selfHeal: true}
+    syncOptions: [CreateNamespace=true]
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: sre-token-production
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/your-org/sre-token-platform.git
+    targetRevision: main
+    path: k8s/overlays/production
+    kustomize:
+      buildOptions: --load-restrictor LoadRestrictionsNone
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: sre-platform-production
+  syncPolicy:
+    automated: {prune: false, selfHeal: false}
+    syncOptions: [CreateNamespace=true]

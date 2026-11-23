@@ -1,0 +1,25 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: postgres
+  namespace: sre-platform
+spec:
+  instances: 3
+  imageName: ghcr.io/cloudnative-pg/postgresql:16
+  primaryUpdateStrategy: supervised
+  bootstrap:
+    initdb:
+      database: tokendb
+      owner: postgres
+      secret:
+        name: platform-secrets
+  superuserSecret:
+    name: platform-secrets
+  storage:
+    size: 10Gi
+  resources:
+    requests: {cpu: 250m, memory: 256Mi}
+    limits: {cpu: "1", memory: 1Gi}
+  affinity:
+    topologyKey: topology.kubernetes.io/zone
+    podAntiAffinityType: required

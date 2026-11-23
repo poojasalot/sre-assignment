@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: sre-platform-production
+resources:
+  - ../../platform
+  - ../../apps/python-service
+  - ../../apps/go-service
+replicas:
+  - name: python-token-service
+    count: 3
+  - name: go-token-service
+    count: 3
+images:
+  - name: ghcr.io/your-org/sre-python-service
+    newTag: production
+  - name: ghcr.io/your-org/sre-go-service
+    newTag: production

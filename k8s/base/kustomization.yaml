@@ -1,0 +1,53 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: sre-platform
+resources:
+  - namespace.yaml
+  - config.yaml
+  - postgres.yaml
+  - redis.yaml
+  - python-service.yaml
+  - go-service.yaml
+  - observability.yaml
+  - observability-storage.yaml
+  - autoscaling.yaml
+  - network-policies.yaml
+  - database-migration.yaml
+configMapGenerator:
+  - name: token-db-init
+    files:
+      - database-init.sql=config-files/database-init.sql
+  - name: otel-collector-config
+    files:
+      - collector.yaml=config-files/collector.yaml
+  - name: loki-config
+    files:
+      - loki.yaml=config-files/loki.yaml
+  - name: tempo-config
+    files:
+      - tempo.yaml=config-files/tempo.yaml
+  - name: prometheus-config
+    files:
+      - prometheus.yml=config-files/prometheus.yml
+  - name: prometheus-alert-rules
+    files:
+      - alert-rules.yml=config-files/alert-rules.yml
+  - name: grafana-datasources
+    files:
+      - datasources.yaml=config-files/datasources.yaml
+  - name: grafana-dashboard-provider
+    files:
+      - dashboards.yaml=config-files/dashboards.yaml
+  - name: grafana-dashboard-data
+    files:
+      - sre-token-platform.json=config-files/sre-token-platform.json
+generatorOptions:
+  disableNameSuffixHash: false
+
+images:
+  - name: ghcr.io/your-org/sre-python-service
+    newName: ghcr.io/your-org/sre-python-service
+    newTag: 1.0.0
+  - name: ghcr.io/your-org/sre-go-service
+    newName: ghcr.io/your-org/sre-go-service
+    newTag: 1.0.0

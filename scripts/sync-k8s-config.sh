@@ -1,0 +1,16 @@
+#!/usr/bin/env sh
+set -eu
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+DEST="$ROOT/k8s/base/config-files"
+mkdir -p "$DEST"
+cp "$ROOT/database/init.sql" "$DEST/database-init.sql"
+cp "$ROOT/observability/otel/collector.yaml" "$DEST/collector.yaml"
+cp "$ROOT/observability/loki/loki.yaml" "$DEST/loki.yaml"
+cp "$ROOT/observability/tempo/tempo.yaml" "$DEST/tempo.yaml"
+cp "$ROOT/observability/prometheus/prometheus-k8s.yml" "$DEST/prometheus.yml"
+cp "$ROOT/observability/prometheus/alert-rules.yml" "$DEST/alert-rules.yml"
+cp "$ROOT/observability/grafana/provisioning/datasources/datasources.yaml" "$DEST/datasources.yaml"
+cp "$ROOT/observability/grafana/provisioning/dashboards/dashboards.yaml" "$DEST/dashboards.yaml"
+cp "$ROOT/observability/grafana/dashboards/sre-token-platform.json" "$DEST/sre-token-platform.json"
+cp "$ROOT/observability/alertmanager/alertmanager.yml" "$DEST/alertmanager.yml"
+echo "Kubernetes ConfigMap input files synchronized."

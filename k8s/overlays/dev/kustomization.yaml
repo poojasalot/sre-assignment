@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: sre-platform-dev
+resources:
+  - ../../platform
+  - ../../apps/python-service
+  - ../../apps/go-service
+images:
+  - name: ghcr.io/your-org/sre-python-service
+    newTag: dev
+  - name: ghcr.io/your-org/sre-go-service
+    newTag: dev
+replicas:
+  - name: python-token-service
+    count: 1
+  - name: go-token-service
+    count: 1

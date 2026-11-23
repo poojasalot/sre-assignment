@@ -1,0 +1,99 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: database-migrations
+  namespace: sre-platform
+data:
+  001_initial.sql: |
+    BEGIN;
+
+    CREATE TABLE IF NOT EXISTS users (
+      id VARCHAR(36) PRIMARY KEY,
+      email VARCHAR(255) UNIQUE NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS groups (
+      id VARCHAR(36) PRIMARY KEY,
+      name VARCHAR(100) NOT NULL UNIQUE
+    );
+
+    CREATE TABLE IF NOT EXISTS memberships (
+      user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      group_id VARCHAR(36) NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+      PRIMARY KEY (user_id, group_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS group_permissions (
+      group_id VARCHAR(36) NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+      permission VARCHAR(100) NOT NULL,
+      PRIMARY KEY (group_id, permission)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_memberships_group_id ON memberships(group_id);
+    CREATE INDEX IF NOT EXISTS idx_group_permissions_permission ON group_permissions(permission);
+
+    INSERT INTO groups (id, name) VALUES
+      ('grp-1', 'researchers'), ('grp-2', 'admins')
+    ON CONFLICT (id) DO NOTHING;
+
+    INSERT INTO group_permissions (group_id, permission) VALUES
+      ('grp-1', 'read:data'), ('grp-1', 'write:data'),
+      ('grp-2', 'read:data'), ('grp-2', 'admin:users')
+    ON CONFLICT (group_id, permission) DO NOTHING;
+
+    INSERT INTO users (id, email) VALUES
+      ('user-1', 'alice@example.com'), ('user-2', 'bob@example.com')
+    ON CONFLICT (id) DO NOTHING;
+
+    INSERT INTO memberships (user_id, group_id) VALUES
+      ('user-1', 'grp-1'), ('user-2', 'grp-2')
+    ON CONFLICT (user_id, group_id) DO NOTHING;
+
+    COMMIT;
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: database-migration-001
+  namespace: sre-platform
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: migrate
+          image: postgres:16-alpine
+          command:
+            - sh
+            - -ec
+            - |
+              for i in $(seq 1 30); do
+                pg_isready -h postgres-rw -U "$POSTGRES_USER" -d "$POSTGRES_DB" && break
+                sleep 2
+              done
+              psql "postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@postgres-rw:5432/$POSTGRES_DB" -v ON_ERROR_STOP=1 -f /migrations/001_initial.sql
+          env:
+            - name: POSTGRES_DB
+              valueFrom: {configMapKeyRef: {name: platform-config, key: POSTGRES_DB}}
+            - name: POSTGRES_USER
+              valueFrom: {configMapKeyRef: {name: platform-config, key: POSTGRES_USER}}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: platform-secrets, key: POSTGRES_PASSWORD}}
+          volumeMounts:
+            - name: migrations
+              mountPath: /migrations
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+      volumes:
+        - name: migrations
+          configMap:
+            name: database-migrations
