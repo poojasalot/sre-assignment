@@ -1,3 +1,4 @@
+# Multi-node, multi-zone cluster: base HA topology with a higher autoscaling floor.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: sre-platform-production
@@ -5,13 +6,14 @@ resources:
   - ../../platform
   - ../../apps/python-service
   - ../../apps/go-service
-replicas:
-  - name: python-token-service
-    count: 3
-  - name: go-token-service
-    count: 3
+# Promote immutable tags (e.g. the git SHA built by CI), never a moving tag.
 images:
-  - name: ghcr.io/your-org/sre-python-service
-    newTag: production
-  - name: ghcr.io/your-org/sre-go-service
-    newTag: production
+  - {name: ghcr.io/your-org/sre-python-service, newTag: 1.0.0}
+  - {name: ghcr.io/your-org/sre-go-service, newTag: 1.0.0}
+patches:
+  - target: {kind: ConfigMap, name: platform-config}
+    patch: |-
+      - {op: replace, path: /data/DEPLOYMENT_ENVIRONMENT, value: production}
+  - target: {kind: HorizontalPodAutoscaler}
+    patch: |-
+      - {op: replace, path: /spec/minReplicas, value: 3}

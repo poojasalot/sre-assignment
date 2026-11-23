@@ -1,77 +1,139 @@
+# SLIs are recorded once per window and reused by the burn-rate alerts.
+# Provisional SLO: 99.9% availability (error budget 0.001). Burn-rate thresholds follow the
+# multi-window pattern from the Google SRE workbook: 14.4x over 1h+5m pages, 6x over 6h+30m warns.
+# Unit tests: promtool test rules observability/prometheus/alert-rules.test.yml
 groups:
+  - name: sli-recording
+    rules:
+      - record: job:http_server_error_ratio:rate5m
+        expr: sum by (job) (rate(http_server_requests_total{status_code=~"5.."}[5m])) / clamp_min(sum by (job) (rate(http_server_requests_total[5m])), 0.001)
+      - record: job:http_server_error_ratio:rate30m
+        expr: sum by (job) (rate(http_server_requests_total{status_code=~"5.."}[30m])) / clamp_min(sum by (job) (rate(http_server_requests_total[30m])), 0.001)
+      - record: job:http_server_error_ratio:rate1h
+        expr: sum by (job) (rate(http_server_requests_total{status_code=~"5.."}[1h])) / clamp_min(sum by (job) (rate(http_server_requests_total[1h])), 0.001)
+      - record: job:http_server_error_ratio:rate6h
+        expr: sum by (job) (rate(http_server_requests_total{status_code=~"5.."}[6h])) / clamp_min(sum by (job) (rate(http_server_requests_total[6h])), 0.001)
+      # Server-side gRPC failures only; InvalidArgument/NotFound are caller errors.
+      - record: job:grpc_server_error_ratio:rate5m
+        expr: sum by (job) (rate(grpc_server_requests_total{status=~"Internal|Unavailable|DeadlineExceeded|Unknown|ResourceExhausted"}[5m])) / clamp_min(sum by (job) (rate(grpc_server_requests_total[5m])), 0.001)
+      - record: job:grpc_server_error_ratio:rate30m
+        expr: sum by (job) (rate(grpc_server_requests_total{status=~"Internal|Unavailable|DeadlineExceeded|Unknown|ResourceExhausted"}[30m])) / clamp_min(sum by (job) (rate(grpc_server_requests_total[30m])), 0.001)
+      - record: job:grpc_server_error_ratio:rate1h
+        expr: sum by (job) (rate(grpc_server_requests_total{status=~"Internal|Unavailable|DeadlineExceeded|Unknown|ResourceExhausted"}[1h])) / clamp_min(sum by (job) (rate(grpc_server_requests_total[1h])), 0.001)
+      - record: job:grpc_server_error_ratio:rate6h
+        expr: sum by (job) (rate(grpc_server_requests_total{status=~"Internal|Unavailable|DeadlineExceeded|Unknown|ResourceExhausted"}[6h])) / clamp_min(sum by (job) (rate(grpc_server_requests_total[6h])), 0.001)
+      - record: job:http_server_request_duration_seconds:p95_5m
+        expr: histogram_quantile(0.95, sum by (job, le) (rate(http_server_request_duration_seconds_bucket[5m])))
+      - record: job:grpc_server_request_duration_seconds:p95_5m
+        expr: histogram_quantile(0.95, sum by (job, le) (rate(grpc_server_request_duration_seconds_bucket[5m])))
+
+  - name: slo-burn-rate
+    rules:
+      - alert: PythonAvailabilityFastBurn
+        expr: job:http_server_error_ratio:rate1h{job="python-token-service"} > 14.4 * 0.001 and job:http_server_error_ratio:rate5m{job="python-token-service"} > 14.4 * 0.001
+        for: 2m
+        labels: {severity: critical, team: sre, slo: availability}
+        annotations:
+          summary: Python API is rapidly burning its availability error budget
+          description: 1h and 5m 5xx ratios both exceed 14.4x the 99.9% budget (about 2% of the monthly budget per hour).
+      - alert: PythonAvailabilitySlowBurn
+        expr: job:http_server_error_ratio:rate6h{job="python-token-service"} > 6 * 0.001 and job:http_server_error_ratio:rate30m{job="python-token-service"} > 6 * 0.001
+        for: 10m
+        labels: {severity: warning, team: sre, slo: availability}
+        annotations:
+          summary: Python API is slowly burning its availability error budget
+          description: 6h and 30m 5xx ratios both exceed 6x the 99.9% budget.
+      - alert: GoGrpcAvailabilityFastBurn
+        expr: job:grpc_server_error_ratio:rate1h{job="go-token-service"} > 14.4 * 0.001 and job:grpc_server_error_ratio:rate5m{job="go-token-service"} > 14.4 * 0.001
+        for: 2m
+        labels: {severity: critical, team: sre, slo: availability}
+        annotations:
+          summary: Go token service is rapidly burning its availability error budget
+          description: 1h and 5m gRPC server-failure ratios both exceed 14.4x the 99.9% budget.
+      - alert: GoGrpcAvailabilitySlowBurn
+        expr: job:grpc_server_error_ratio:rate6h{job="go-token-service"} > 6 * 0.001 and job:grpc_server_error_ratio:rate30m{job="go-token-service"} > 6 * 0.001
+        for: 10m
+        labels: {severity: warning, team: sre, slo: availability}
+        annotations:
+          summary: Go token service is slowly burning its availability error budget
+          description: 6h and 30m gRPC server-failure ratios both exceed 6x the 99.9% budget.
+      - alert: PythonHighP95Latency
+        expr: job:http_server_request_duration_seconds:p95_5m{job="python-token-service"} > 0.5
+        for: 10m
+        labels: {severity: warning, team: sre, slo: latency}
+        annotations:
+          summary: Python API p95 latency above 500ms
+          description: Inspect pool acquisition, the SQL span and the MintToken span in a slow trace.
+      - alert: GoGrpcHighP95Latency
+        expr: job:grpc_server_request_duration_seconds:p95_5m{job="go-token-service"} > 0.1
+        for: 10m
+        labels: {severity: warning, team: sre, slo: latency}
+        annotations:
+          summary: Go MintToken p95 latency above 100ms
+          description: Check Redis operation latency and Redis/Sentinel health.
+
   - name: service-availability
-    interval: 30s
     rules:
       - alert: PythonServiceTargetDown
         expr: up{job="python-token-service"} == 0
         for: 2m
         labels: {severity: critical, team: sre}
         annotations:
-          summary: Python token API target is down
-          description: Prometheus has been unable to scrape the Python service for more than 2 minutes.
+          summary: A Python token API target is down
+          description: Prometheus cannot scrape {{ $labels.instance }}.
       - alert: GoServiceTargetDown
         expr: up{job="go-token-service"} == 0
         for: 2m
         labels: {severity: critical, team: sre}
         annotations:
-          summary: Go token gRPC service metrics target is down
-          description: Prometheus has been unable to scrape the Go service for more than 2 minutes.
-      - alert: PythonAvailabilityFastBurn
-        expr: (sum(rate(http_server_requests_total{job="python-token-service",status_code=~"5.."}[1h])) / clamp_min(sum(rate(http_server_requests_total{job="python-token-service"}[1h])), 0.001) > 0.0144) and (sum(rate(http_server_requests_total{job="python-token-service",status_code=~"5.."}[5m])) / clamp_min(sum(rate(http_server_requests_total{job="python-token-service"}[5m])), 0.001) > 0.0144)
-        for: 2m
-        labels: {severity: critical, team: sre, slo: availability}
-        annotations:
-          summary: Python API is rapidly burning its availability error budget
-          description: For a provisional 99.9% availability SLO, the 1h and 5m error ratios both exceed a 14.4x burn rate.
-      - alert: PythonAvailabilitySlowBurn
-        expr: (sum(rate(http_server_requests_total{job="python-token-service",status_code=~"5.."}[6h])) / clamp_min(sum(rate(http_server_requests_total{job="python-token-service"}[6h])), 0.001) > 0.006) and (sum(rate(http_server_requests_total{job="python-token-service",status_code=~"5.."}[30m])) / clamp_min(sum(rate(http_server_requests_total{job="python-token-service"}[30m])), 0.001) > 0.006)
-        for: 10m
-        labels: {severity: warning, team: sre, slo: availability}
-        annotations:
-          summary: Python API is slowly burning its availability error budget
-          description: The 6h and 30m error ratios both exceed a 6x burn rate for a provisional 99.9% SLO.
-      - alert: GoGrpcAvailabilityFastBurn
-        expr: (sum(rate(grpc_server_requests_total{job="go-token-service",status=~"Internal|Unavailable|DeadlineExceeded|Unknown|ResourceExhausted"}[1h])) / clamp_min(sum(rate(grpc_server_requests_total{job="go-token-service"}[1h])), 0.001) > 0.0144) and (sum(rate(grpc_server_requests_total{job="go-token-service",status=~"Internal|Unavailable|DeadlineExceeded|Unknown|ResourceExhausted"}[5m])) / clamp_min(sum(rate(grpc_server_requests_total{job="go-token-service"}[5m])), 0.001) > 0.0144)
-        for: 2m
-        labels: {severity: critical, team: sre, slo: availability}
-        annotations:
-          summary: Go token service is rapidly burning its availability error budget
-          description: gRPC server error ratio exceeds the 14.4x burn-rate threshold in both 1h and 5m windows.
-      - alert: PythonHigh5xxRate
-        expr: (sum(rate(http_server_requests_total{job="python-token-service",status_code=~"5.."}[5m])) / clamp_min(sum(rate(http_server_requests_total{job="python-token-service"}[5m])), 0.001)) > 0.02
+          summary: A Go token service target is down
+          description: Prometheus cannot scrape {{ $labels.instance }}.
+      # `up == 0` cannot fire when every pod is gone: the targets disappear with their endpoints.
+      - alert: PythonServiceAbsent
+        expr: absent(up{job="python-token-service"} == 1)
         for: 5m
-        labels: {severity: warning, team: sre}
+        labels: {severity: critical, team: sre}
         annotations:
-          summary: Python API 5xx ratio above 2%
-          description: More than 2% of Python API requests returned 5xx for 5 minutes.
-      - alert: PythonHighP95Latency
-        expr: histogram_quantile(0.95, sum by (le) (rate(http_server_request_duration_seconds_bucket{job="python-token-service"}[5m]))) > 0.5
-        for: 10m
-        labels: {severity: warning, team: sre}
-        annotations:
-          summary: Python API p95 latency above 500ms
-          description: p95 latency exceeded 500ms for 10 minutes.
-      - alert: GoGrpcHighErrorRate
-        expr: (sum(rate(grpc_server_requests_total{job="go-token-service",status!="OK"}[5m])) / clamp_min(sum(rate(grpc_server_requests_total{job="go-token-service"}[5m])), 0.001)) > 0.02
+          summary: No healthy Python token API target
+          description: Prometheus has no scrapeable python-token-service instance.
+      - alert: GoServiceAbsent
+        expr: absent(up{job="go-token-service"} == 1)
         for: 5m
-        labels: {severity: warning, team: sre}
+        labels: {severity: critical, team: sre}
         annotations:
-          summary: Go gRPC non-OK ratio above 2%
-          description: More than 2% of gRPC responses were non-OK for 5 minutes; inspect client errors separately from server failures.
+          summary: No healthy Go token service target
+          description: Prometheus has no scrapeable go-token-service instance.
+
+  - name: dependencies
+    rules:
       - alert: DatabasePoolNearExhaustion
         expr: db_pool_connections_in_use{job="python-token-service"} / clamp_min(db_pool_connections_max{job="python-token-service"}, 1) > 0.8
         for: 5m
         labels: {severity: warning, team: sre}
         annotations:
           summary: PostgreSQL connection pool above 80% utilisation
-          description: Pool saturation may cause request queueing and acquisition timeouts.
+          description: Pool saturation causes request queueing and acquisition timeouts.
       - alert: DatabasePoolAcquireFailures
         expr: increase(db_pool_acquire_errors_total{job="python-token-service"}[5m]) > 0
         for: 1m
         labels: {severity: critical, team: sre}
         annotations:
           summary: PostgreSQL connection pool acquisition is timing out
-          description: At least one connection acquisition timed out in the last 5 minutes.
+          description: At least one connection acquisition failed in the last 5 minutes.
+      - alert: PostgresExporterDown
+        expr: cnpg_collector_up == 0
+        for: 2m
+        labels: {severity: critical, team: sre}
+        annotations:
+          summary: CloudNativePG cannot reach PostgreSQL on {{ $labels.pod }}
+          description: The instance exporter reports PostgreSQL as unreachable.
+      - alert: RedisDown
+        expr: redis_up{job="redis-exporter"} == 0
+        for: 1m
+        labels: {severity: critical, team: sre}
+        annotations:
+          summary: Redis instance unreachable
+          description: The Redis exporter on {{ $labels.instance }} cannot reach Redis.
       - alert: RedisOperationP95High
         expr: histogram_quantile(0.95, sum by (le) (rate(redis_operation_duration_seconds_bucket{job="go-token-service"}[5m]))) > 0.05
         for: 10m
@@ -85,7 +147,7 @@ groups:
         labels: {severity: warning, team: sre}
         annotations:
           summary: Redis client pool acquisition timeouts detected
-          description: Redis pool acquisition timeouts increased in the last 5 minutes; inspect connection saturation and downstream latency.
+          description: Inspect pool saturation, Redis maxclients and network latency.
       - alert: TokenMintFailureSpike
         expr: (sum(rate(tokens_minted_total{job="go-token-service",status="error"}[5m])) / clamp_min(sum(rate(tokens_minted_total{job="go-token-service"}[5m])), 0.001)) > 0.01
         for: 5m
@@ -93,3 +155,31 @@ groups:
         annotations:
           summary: Token mint failures above 1%
           description: More than 1% of token mint attempts failed for 5 minutes.
+
+  - name: audit-queue
+    rules:
+      # Every Go replica reports the same stream, hence max() rather than sum().
+      - alert: AuditQueueBacklog
+        expr: max(redis_stream_lag_messages{job="go-token-service"}) + max(redis_stream_pending_messages{job="go-token-service"}) > 1000
+        for: 10m
+        labels: {severity: warning, team: sre}
+        annotations:
+          summary: Audit queue backlog above 1000 messages
+          description: Consumers are not keeping up; check consumer errors and processing duration.
+      - alert: AuditQueueStalled
+        expr: max(redis_stream_oldest_pending_age_seconds{job="go-token-service"}) > 300
+        for: 5m
+        labels: {severity: warning, team: sre}
+        annotations:
+          summary: Audit message unacknowledged for over 5 minutes
+          description: Live consumers reclaim a dead consumer's messages after 30s, so no consumer is processing or acknowledging; check go-token-service pods, audit_ack_failed logs and XPENDING.
+
+  - name: telemetry-pipeline
+    rules:
+      - alert: OtelCollectorExportFailures
+        expr: sum(rate(otelcol_exporter_send_failed_spans_total[5m])) + sum(rate(otelcol_exporter_send_failed_log_records_total[5m])) > 0
+        for: 10m
+        labels: {severity: warning, team: sre}
+        annotations:
+          summary: The OpenTelemetry Collector is failing to export telemetry
+          description: Traces or logs are being dropped on the way to Tempo or Loki.

@@ -1,42 +1,42 @@
+# Shared platform: data stores, observability stack and network policies.
+# ConfigMaps are generated from the same canonical files Docker Compose mounts, so the two
+# environments cannot drift. Reading files outside this directory requires
+#   kubectl kustomize --load-restrictor LoadRestrictionsNone
+# (Argo CD: set `kustomize.buildOptions: --load-restrictor LoadRestrictionsNone` in argocd-cm).
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: sre-platform
 resources:
-  - ../base/namespace.yaml
-  - ../base/config.yaml
-  - ../base/postgres.yaml
-  - ../base/redis.yaml
-  - ../base/database-migration.yaml
-  - ../base/observability.yaml
-  - ../base/observability-storage.yaml
-  - ../base/network-policies.yaml
+  - namespace.yaml
+  - config.yaml
+  - postgres.yaml
+  - redis.yaml
+  - observability.yaml
+  - observability-storage.yaml
+  - network-policies.yaml
 configMapGenerator:
-  - name: token-db-init
+  # Referenced from the CloudNativePG Cluster, a field Kustomize cannot rewrite, so no hash suffix.
+  - name: token-db-schema
+    options: {disableNameSuffixHash: true}
     files:
-      - database-init.sql=../base/config-files/database-init.sql
+      - init.sql=../../database/init.sql
+    literals:
+      - grants.sql=GRANT SELECT ON ALL TABLES IN SCHEMA public TO app;
   - name: otel-collector-config
-    files:
-      - collector.yaml=../base/config-files/collector.yaml
+    files: [collector.yaml=../../observability/otel/collector.yaml]
   - name: loki-config
-    files:
-      - loki.yaml=../base/config-files/loki.yaml
+    files: [loki.yaml=../../observability/loki/loki.yaml]
   - name: tempo-config
-    files:
-      - tempo.yaml=../base/config-files/tempo.yaml
+    files: [tempo.yaml=../../observability/tempo/tempo.yaml]
   - name: prometheus-config
-    files:
-      - prometheus.yml=../base/config-files/prometheus.yml
+    files: [prometheus.yml=../../observability/prometheus/prometheus-k8s.yml]
   - name: prometheus-alert-rules
-    files:
-      - alert-rules.yml=../base/config-files/alert-rules.yml
+    files: [alert-rules.yml=../../observability/prometheus/alert-rules.yml]
+  - name: alertmanager-config
+    files: [alertmanager.yml=../../observability/alertmanager/alertmanager.yml]
   - name: grafana-datasources
-    files:
-      - datasources.yaml=../base/config-files/datasources.yaml
+    files: [datasources.yaml=../../observability/grafana/provisioning/datasources/datasources.yaml]
   - name: grafana-dashboard-provider
-    files:
-      - dashboards.yaml=../base/config-files/dashboards.yaml
+    files: [dashboards.yaml=../../observability/grafana/provisioning/dashboards/dashboards.yaml]
   - name: grafana-dashboard-data
-    files:
-      - sre-token-platform.json=../base/config-files/sre-token-platform.json
-generatorOptions:
-  disableNameSuffixHash: false
+    files: [sre-token-platform.json=../../observability/grafana/dashboards/sre-token-platform.json]

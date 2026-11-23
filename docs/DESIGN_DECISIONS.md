@@ -16,7 +16,8 @@ This document records the reasoning behind the implementation as an SRE lead wou
 - A single gRPC channel is reused by the Python process. Per-request channel creation wastes sockets and connection establishment time. A per-RPC deadline limits resource occupancy when Go or Redis is degraded.
 - The Go service distinguishes invalid input, missing token, and dependency outage. A missing Redis key means an invalid/expired token; a Redis network error is a service failure and returns gRPC `Unavailable`.
 - Liveness checks whether a process can serve health traffic; readiness checks mandatory dependencies. Dependency failure should remove the pod from Service endpoints rather than cause repeated liveness restarts.
-- Shutdown closes the gRPC server gracefully, stops HTTP health/metrics server, closes Redis and flushes telemetry within a bounded timeout.
+- Shutdown closes the gRPC server gracefully, stops the HTTP health and metrics server, drains the audit consumer, closes Redis and flushes telemetry within a bounded timeout.
+- gRPC TLS fails closed. If any `GRPC_TLS_*` certificate setting is present but cannot be loaded (bad path or invalid CA), the Go service exits with `grpc_tls_config_invalid` instead of silently serving plaintext. Plaintext is used only when no TLS settings are given, which is the local demo, and the service logs this at startup (`grpc_transport=plaintext_demo`).
 
 **Alternative:** use async SQLAlchemy + asyncpg with FastAPI async handlers if the service is redesigned around async I/O. The current synchronous psycopg2 handler is valid because FastAPI runs synchronous endpoints in its thread pool; do not mix blocking psycopg2 calls directly into `async def` endpoints.
 
@@ -32,15 +33,30 @@ This document records the reasoning behind the implementation as an SRE lead wou
 
 Trace propagation uses W3C Trace Context. Trace and log resource metadata include service name, service version and deployment environment. Redis spans are intentionally manual/sanitised: automatic command instrumentation can capture key/value arguments such as opaque tokens or user identifiers, so only the Redis operation name is recorded. Metric labels avoid user email, token, raw URL path, trace ID and other unbounded/high-cardinality values.
 
-## 4. Redis queue metric decision
+## 4. Redis audit queue
 
-The starter's Redis usage is `SET` with TTL and `GET`; there is no queue, list, stream or worker. A queue-depth metric is not semantically valid. The implementation exposes:
+The starter used Redis only as a key/value store, so it had no queue whose depth could be measured. The
+assignment asks for queue depth and processing time, so the Go service now has a real asynchronous workload:
+every minted token publishes a `token_minted` audit event (permission count, TTL, `traceparent`; no token or
+email) to the `token:events` Redis Stream. A consumer group, `audit`, runs in every Go replica and processes
+the events.
 
-- `redis_operations_total{operation,status}`
-- `redis_operation_duration_seconds{operation}`
-- `redis_db_keys` (Redis DB 0 key count; approximate overall datastore occupancy, not token-only count)
+| Decision | Reason | Alternative |
+|---|---|---|
+| A Stream rather than a List | Consumer groups, per-message acknowledgement, a pending-entries list and replay give at-least-once delivery and make *lag* and *pending* measurable | A List with `BRPOPLPUSH` needs hand-written acknowledgement, retry and visibility tracking |
+| Publishing is best-effort | An audit outage must not fail token issuance. Failures are logged (`audit_event_publish_failed`) and counted by `redis_operations_total{operation="xadd",status="error"}` | A transactional outbox in PostgreSQL would guarantee delivery, at the cost of an extra write on the hot path |
+| `XAUTOCLAIM` after 30 s idle | Consumer names are pod hostnames, so a crashed pod's pending messages would otherwise never be acknowledged | Fixed consumer names on a StatefulSet; more coupling, no benefit |
+| `MAXLEN ~ 10000` | Bounds Redis memory. Acknowledged history is not needed after processing | Time-based trimming with `MINID` |
+| Trace context in the message | The consumer span `audit.process` joins the request's trace, so asynchronous work appears in the same Tempo trace | Span links, which keep separate traces |
 
-If a Redis Stream is added, use `XINFO GROUPS` / pending-entry metrics and oldest pending age. If a Redis List queue is added, use `LLEN`, dequeue/ack throughput, retry/dead-letter counts and processing-duration histograms. The choice depends on delivery guarantees: Streams provide consumer groups, pending-entry tracking and replay; Lists are simpler but require more custom acknowledgement/retry handling.
+Depth and age metrics are read at scrape time from Redis (`XLEN`, `XINFO GROUPS`, `XPENDING`), so every
+replica reports the same group-wide numbers. Dashboards and alerts therefore aggregate with `max()`, not
+`sum()`. The total backlog is `lag + pending`. Processing time is the histogram
+`queue_message_processing_duration_seconds`, measured per message from receipt to `XACK`.
+
+The original Redis client metrics remain: `redis_operations_total`, `redis_operation_duration_seconds`,
+`redis_pool_*` and `redis_db_keys`. Server-side metrics such as `redis_up`, role, memory, clients and
+replication come from `redis_exporter`.
 
 ## 5. Token storage alternatives
 
@@ -56,14 +72,42 @@ For a real identity service, do not use the demo's random hex token format as a 
 
 ## 6. Kubernetes choices
 
-- Kustomize was selected over Helm to keep a small assignment's rendered resources inspectable and avoid chart templating overhead. Helm is a better fit for reusable multi-environment packaging and versioned dependencies.
-- Deployments run the stateless Python and Go services with independent replicas. Kubernetes PostgreSQL uses CloudNativePG and Redis uses StatefulSets plus Sentinel. Backup, restore, failover and capacity evidence remain required before production.
-- Requests and limits are explicit; HPAs use CPU as an initial scale signal. Production autoscaling should consider request rate, in-flight work, queue depth (if a real queue exists), p95 latency and downstream saturation as well.
-- NetworkPolicies restrict ingress paths. They only work when the cluster CNI enforces them. The sample assumes an `ingress-nginx` namespace for inbound HTTP and a metrics-server for HPA.
-- PDBs preserve at least one pod during voluntary disruptions, but do not replace multi-zone placement, capacity planning or graceful node failure design.
+- **Kustomize over Helm.** The rendered resources stay inspectable for a small platform. Helm fits reusable,
+  versioned packaging better.
+- **One source of truth for config.** `k8s/platform` generates its ConfigMaps directly from
+  `observability/` and `database/`, the same files Compose mounts. This removes the class of bug where a
+  copied Kubernetes config drifts from the tested one. The cost is that rendering needs
+  `--load-restrictor LoadRestrictionsNone`, which must also be set in Argo CD's `argocd-cm`. Generated
+  ConfigMaps carry content hashes, so a change rolls out the pods that use it. The schema ConfigMap keeps a
+  stable name, because Kustomize cannot rewrite the reference inside the CNPG `Cluster` custom resource,
+  and CNPG reads it only at bootstrap anyway.
+- **Separate roots** for the platform and each app allow independent reconciliation. Overlays compose them
+  per environment.
+- **Stateful dependencies through proven patterns.** PostgreSQL runs on CloudNativePG, which handles
+  failover, the `-rw` Service, generated credentials and metrics. Redis runs as a StatefulSet with AOF on
+  PVCs plus three Sentinels using hostname announcements. A Redis pod discovers the current primary from
+  Sentinel before starting, so a restarted former primary rejoins as a replica instead of creating a
+  split-brain.
+- **Replica counts belong to the HPA.** Deployments omit `replicas`, so re-applying manifests never fights
+  the autoscaler. HPAs scale on CPU as an initial signal. Production should add request rate or queue lag.
+- **Default deny in both directions.** Every flow, including DNS, the Kubernetes API (for Prometheus
+  discovery and the CNPG instance manager) and the CNPG operator, has an explicit policy. kind's CNI enforces
+  them, so the e2e run exercises these policies.
+- **Prometheus RBAC is a namespaced Role.** Service discovery is limited to its own namespace
+  (`own_namespace: true`), so environments sharing a cluster cannot see each other.
+- **Dev runs on a single node.** The dev overlay relaxes required anti-affinity and runs one PostgreSQL
+  instance. Staging and production keep the HA topology.
 
-## 7. Bonus scope: what was and was not implemented
+## 7. Bonus scope
 
-**Implemented:** CI test/build workflow, HPA, PDB, basic SLO/error-budget alert expressions, and NetworkPolicies.
+**Implemented:**
 
-**Not implemented intentionally:** Istio/Linkerd. They add sidecars, certificates and policy overhead without a concrete traffic-management or mesh requirement in this assignment. Argo CD examples and dev/staging/production overlays are implemented, but repository credentials, promotion approval and drift reconciliation remain platform integration work.
+- CI with config, schema, image and end-to-end checks.
+- HPAs and PDBs.
+- Multi-window burn-rate SLO alerts with rule unit tests.
+- Default-deny NetworkPolicies.
+- Argo CD Applications per environment.
+
+**Not implemented, intentionally:** Istio or Linkerd. They add sidecars, certificates and policy overhead
+without a traffic-management requirement here. The Go service supports application-level mTLS and refuses to
+start if TLS is configured incorrectly.

@@ -1,42 +1,55 @@
-DOCKER_COMPOSE := $(shell if docker compose version >/dev/null 2>&1; then echo 'docker compose'; elif command -v docker-compose >/dev/null 2>&1; then echo 'docker-compose'; else echo 'docker compose'; fi)
+K8S_ROOTS := platform apps/python-service apps/go-service overlays/dev overlays/staging overlays/production
+KUSTOMIZE := kubectl kustomize --load-restrictor LoadRestrictionsNone
+CRD_SCHEMAS := https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json
 
-.PHONY: compose-up compose-down python-test go-test go-vet smoke observability-validation k8s-render k8s-all-render cnpg-install cnpg-status
+.PHONY: compose-up compose-down test python-test go-test smoke observability-validation \
+	validate-config k8s-render k8s-validate k8s-secrets cnpg-install k8s-dev-apply kind-e2e
 
 compose-up:
-	$(DOCKER_COMPOSE) up --build -d
+	docker compose up --build -d --wait
 
 compose-down:
-	$(DOCKER_COMPOSE) down
+	docker compose down
+
+test: python-test go-test
 
 python-test:
-	cd python-service && python -m pytest -q
+	python -m pytest -q
 
 go-test:
-	cd golang-service && go test ./...
-
-go-vet:
-	cd golang-service && go vet ./...
+	cd golang-service && test -z "$$(gofmt -l .)" && go vet ./... && go test -race ./...
 
 smoke:
 	./scripts/smoke-test.sh
 
-k8s-render:
-	kubectl kustomize k8s/base
-
 observability-validation:
 	./scripts/validate-observability.sh
 
-k8s-all-render:
-	kubectl kustomize k8s/base >/tmp/sre-platform.yaml
-	kubectl kustomize --load-restrictor LoadRestrictionsNone k8s/platform >/tmp/sre-platform-shared.yaml
-	kubectl kustomize --load-restrictor LoadRestrictionsNone k8s/apps/python-service >/tmp/sre-python.yaml
-	kubectl kustomize --load-restrictor LoadRestrictionsNone k8s/apps/go-service >/tmp/sre-go.yaml
-	kubectl kustomize --load-restrictor LoadRestrictionsNone k8s/overlays/dev >/tmp/sre-dev.yaml
-	kubectl kustomize --load-restrictor LoadRestrictionsNone k8s/overlays/staging >/tmp/sre-staging.yaml
-	kubectl kustomize --load-restrictor LoadRestrictionsNone k8s/overlays/production >/tmp/sre-production.yaml
+# Requires promtool, amtool and otelcol-contrib on PATH (CI runs them from the deployed images).
+validate-config:
+	promtool check config --syntax-only observability/prometheus/prometheus-compose.yml
+	promtool check config --syntax-only observability/prometheus/prometheus-k8s.yml
+	promtool check rules observability/prometheus/alert-rules.yml
+	promtool test rules observability/prometheus/alert-rules.test.yml
+	amtool check-config observability/alertmanager/alertmanager.yml
+	otelcol-contrib validate --config=observability/otel/collector.yaml
+
+k8s-render:
+	mkdir -p rendered
+	for root in $(K8S_ROOTS); do $(KUSTOMIZE) k8s/$$root > rendered/$$(echo $$root | tr / -).yaml; done
+
+k8s-validate: k8s-render
+	kubeconform -strict -summary -schema-location default -schema-location '$(CRD_SCHEMAS)' \
+		rendered/*.yaml k8s/argocd-application.example.yaml
 
 cnpg-install:
 	./scripts/install-cnpg.sh
 
-cnpg-status:
-	kubectl -n sre-platform get clusters.postgresql.cnpg.io,pods,pvc
+k8s-secrets:
+	./scripts/create-k8s-secrets.sh sre-platform-dev
+
+k8s-dev-apply: k8s-secrets
+	$(KUSTOMIZE) k8s/overlays/dev | kubectl apply --server-side -f -
+
+kind-e2e:
+	./scripts/kind-e2e.sh

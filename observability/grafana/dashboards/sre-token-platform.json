@@ -9,7 +9,7 @@
   ],
   "timezone": "browser",
   "schemaVersion": 41,
-  "version": 1,
+  "version": 2,
   "refresh": "30s",
   "time": {
     "from": "now-1h",
@@ -286,6 +286,257 @@
           "refId": "A"
         }
       ]
+    },
+    {
+      "id": 14,
+      "title": "SLIs and Go gRPC RED",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 41,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 15,
+      "title": "Availability SLI (1h, target 99.9%)",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 42,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "1 - job:http_server_error_ratio:rate1h{job=\"python-token-service\"}",
+          "legendFormat": "python API",
+          "refId": "A"
+        },
+        {
+          "expr": "1 - job:grpc_server_error_ratio:rate1h{job=\"go-token-service\"}",
+          "legendFormat": "go MintToken",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 16,
+      "title": "Go gRPC server error ratio",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 8,
+        "y": 42,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "job:grpc_server_error_ratio:rate5m{job=\"go-token-service\"}",
+          "legendFormat": "server failures",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 17,
+      "title": "Go gRPC p50 / p95 latency",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 16,
+        "y": 42,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(grpc_server_request_duration_seconds_bucket{job=\"go-token-service\"}[5m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(grpc_server_request_duration_seconds_bucket{job=\"go-token-service\"}[5m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 18,
+      "title": "Audit queue (Redis Stream token:events)",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 50,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 19,
+      "title": "Queue depth (undelivered + unacknowledged)",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 51,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "max(redis_stream_lag_messages{job=\"go-token-service\"})",
+          "legendFormat": "lag (not yet delivered)",
+          "refId": "A"
+        },
+        {
+          "expr": "max(redis_stream_pending_messages{job=\"go-token-service\"})",
+          "legendFormat": "pending (not yet acked)",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "title": "Message processing duration p95",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 8,
+        "y": 51,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(queue_message_processing_duration_seconds_bucket{job=\"go-token-service\"}[5m])))",
+          "legendFormat": "p95",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 21,
+      "title": "Throughput and oldest pending age",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 16,
+        "y": 51,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (status) (rate(queue_messages_processed_total{job=\"go-token-service\"}[5m]))",
+          "legendFormat": "processed {{status}}/s",
+          "refId": "A"
+        },
+        {
+          "expr": "max(redis_stream_oldest_pending_age_seconds{job=\"go-token-service\"})",
+          "legendFormat": "oldest pending (s)",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "title": "Redis server (redis_exporter)",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 59,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 23,
+      "title": "Redis instances up / role",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 60,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "redis_up{job=\"redis-exporter\"}",
+          "legendFormat": "up {{pod}}",
+          "refId": "A"
+        },
+        {
+          "expr": "redis_instance_info{job=\"redis-exporter\",role=\"master\"}",
+          "legendFormat": "primary {{pod}}",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "title": "Redis connected clients / replicas",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 60,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (pod) (redis_connected_clients{job=\"redis-exporter\"})",
+          "legendFormat": "clients {{pod}}",
+          "refId": "A"
+        },
+        {
+          "expr": "max(redis_connected_slaves{job=\"redis-exporter\"})",
+          "legendFormat": "replicas on primary",
+          "refId": "B"
+        }
+      ]
+    }
+  ],
+  "links": [
+    {
+      "title": "Explore traces (Tempo)",
+      "type": "link",
+      "url": "/explore?schemaVersion=1&panes=%7B%22t%22:%7B%22datasource%22:%22tempo%22%7D%7D",
+      "targetBlank": true
+    },
+    {
+      "title": "Explore logs (Loki)",
+      "type": "link",
+      "url": "/explore?schemaVersion=1&panes=%7B%22l%22:%7B%22datasource%22:%22loki%22%7D%7D",
+      "targetBlank": true
     }
   ]
 }

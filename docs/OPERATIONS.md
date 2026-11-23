@@ -11,7 +11,8 @@ These are **starting targets for the assignment**, not values measured from load
 | Go MintToken latency | p95 < 100 ms | Measure gRPC server duration; refine after Redis and network baseline tests |
 | Token issuance failures | < 0.1% of valid issuance attempts | Use application-level outcomes; separate invalid/unknown user from internal failures |
 | Dependency health | PostgreSQL pool below 80% sustained utilisation; Redis command p95 < 50 ms | Saturation/latency are diagnostic indicators; avoid paging on a single short spike |
-| Telemetry pipeline | no persistent export loss; telemetry pipeline availability monitored | Alert on Collector queue/retry/drop metrics in production; demo Collector currently uses in-memory batching |
+| Audit queue freshness | 99% of audit events acknowledged within 60 s | `queue_message_processing_duration_seconds` plus oldest pending age; `AuditQueueStalled` fires at 300 s |
+| Telemetry pipeline | No sustained export loss | `OtelCollectorExportFailures` alerts on failed span and log exports. The demo Collector batches in memory |
 
 A 99.9% monthly availability target permits approximately 43.8 minutes of downtime in a 30.4-day month. Do not declare an SLO until ownership, eligible traffic, maintenance policy and the measurement window are agreed.
 
@@ -19,32 +20,49 @@ A 99.9% monthly availability target permits approximately 43.8 minutes of downti
 
 The provisioned dashboard is deliberately oriented around RED plus dependency saturation:
 
-1. **Rate:** HTTP requests/sec grouped by route; gRPC calls/sec grouped by full method/status.
-2. **Errors:** HTTP 5xx ratio; gRPC non-OK ratio and token mint errors. Break client input errors away from server errors before computing SLO availability.
-3. **Duration:** HTTP p50/p95; Redis operation p95; PostgreSQL connection acquisition p95.
-4. **Saturation:** DB connections checked out / max; Redis key count; pod CPU/memory and HPA replica count should be added from kube-state-metrics / cAdvisor in a production cluster.
-5. **Dependencies:** database query failures, Redis operation error rate/latency, health/readiness state.
-6. **Golden path:** a dashboard link to Tempo trace search and Loki queries filtered by service/trace ID.
+1. **SLI:** 1-hour availability for the Python API and Go `MintToken` against the 99.9% target.
+2. **Rate:** HTTP requests per second by route; gRPC calls per second by method and status.
+3. **Errors:** HTTP 5xx ratio; gRPC server-error ratio; token mint errors. Client errors (4xx, `InvalidArgument`, `NotFound`) are excluded from the SLI.
+4. **Duration:** HTTP and gRPC p50/p95; Redis operation p95; PostgreSQL connection acquisition p95.
+5. **Saturation:** DB connections checked out against the maximum; Redis pool timeouts; Redis keys.
+6. **Audit queue:** depth (lag + pending), oldest pending age, processing p95, processed per second by status.
+7. **Redis server:** per-pod `redis_up`, current primary, connected clients and replicas (from `redis_exporter`).
+8. **Golden path:** header links to Explore. Loki log lines link to their Tempo trace, and Tempo spans link back to Loki.
 
-## 3. Alert rules currently included
+In a production cluster, add pod CPU and memory, HPA replica counts and node metrics from kube-state-metrics and cAdvisor.
 
-| Alert | Threshold | For | Severity | Rationale / first response |
-|---|---:|---:|---|---|
-| App target down | Prometheus `up == 0` | 2 min | Critical | Check pods/endpoints, restarts, deployment rollout, network policy and metrics endpoint |
-| Python fast burn | 5m and 1h error ratios > 1.44% (14.4x burn for 99.9%) | 2 min | Critical | Check traces/logs by route and dependency; consider rollback or traffic shed |
-| Python slow burn | 30m and 6h error ratios > 0.6% (6x burn) | 10 min | Warning | Find sustained dependency/performance regression before budget is exhausted |
-| Go gRPC fast burn | 5m and 1h server-failure ratios > 1.44% | 2 min | Critical | Check Redis spans/errors, gRPC status, latency and resource pressure |
-| Python 5xx ratio | > 2% | 5 min | Warning | Triage errors by endpoint and trace |
-| Python p95 | > 500 ms | 10 min | Warning | Inspect DB pool acquire, SQL span, Go RPC and Redis command duration |
-| DB pool saturation | > 80% | 5 min | Warning | Check concurrency, slow SQL and pool/database sizing; do not blindly increase pool size |
-| DB pool acquire timeout | any increase in 5m | 1 min | Critical | Check pool in-use/max and PostgreSQL sessions; reduce load or correct leak/query latency |
-| Redis p95 | > 50 ms | 10 min | Warning | Check Redis CPU/memory/network, evictions, persistence and connection pool |
-| Redis pool timeouts | Any increase in 5m | 1 min | Warning | Check pool usage, `maxclients`, network latency and per-replica connection sizing |
-| Token mint error ratio | > 1% | 5 min | Critical | Inspect Go gRPC error code and Redis command outcome |
+## 3. Alert rules
 
-**Important:** Prometheus evaluates these rules and exposes firing alerts in its Alerts page. The assignment ZIP does not configure a real PagerDuty/Slack/email receiver because credentials and GEANT's on-call routing were not provided. Before go-live, add Alertmanager (or your platform's alert router), route critical alerts to the 24/7 on-call, warnings to the service channel, configure inhibition/grouping, and test delivery end to end.
+All ratios come from recording rules (`job:http_server_error_ratio:rate{5m,30m,1h,6h}` and
+`job:grpc_server_error_ratio:rate…`), so dashboards and alerts share one definition. The numerator counts
+only server failures: HTTP 5xx, and the gRPC codes `Internal`, `Unavailable`, `DeadlineExceeded`, `Unknown`
+and `ResourceExhausted`. Client errors such as `InvalidArgument` and `NotFound` never burn budget.
+`observability/prometheus/alert-rules.test.yml` unit-tests the key behaviours: a 5% error rate fires the fast
+burn, 404s never burn budget, missing targets fire `absent()` alerts, and a stalled queue fires.
 
-The initial 99.9% burn-rate rule is an illustrative multi-window pattern. Before production, use recording rules and validate alert calculations with test traffic; distinguish valid 4xx responses (e.g. user not found) from server failures in the SLI numerator/denominator.
+| Alert | Condition | For | Severity | First response |
+|---|---|---:|---|---|
+| `PythonAvailabilityFastBurn` / `GoGrpcAvailabilityFastBurn` | 1h **and** 5m error ratio > 14.4 × 0.1% (2% of the monthly budget gone in 1 h) | 2m | critical | Check the deploy timeline and roll back if correlated; open traces for failing requests |
+| `PythonAvailabilitySlowBurn` / `GoGrpcAvailabilitySlowBurn` | 6h **and** 30m error ratio > 6 × 0.1% | 10m | warning | Find the sustained regression before the budget is exhausted |
+| `PythonHighP95Latency` | p95 > 500 ms | 10m | warning | Compare pool acquire p95, SQL span, gRPC and Redis span durations |
+| `GoGrpcHighP95Latency` | p95 > 100 ms | 10m | warning | Check Redis p95, Redis CPU, and pool timeouts |
+| `PythonServiceTargetDown` / `GoServiceTargetDown` | `up == 0` | 2m | critical | Check pods, restarts, rollout, the NetworkPolicy and the metrics port |
+| `PythonServiceAbsent` / `GoServiceAbsent` | No healthy target exists at all (`absent(up == 1)`) | 5m | critical | The Deployment was deleted, scaled to zero, or discovery is broken. A plain `up == 0` alert is silent in this case |
+| `DatabasePoolNearExhaustion` | in use / max > 80% | 5m | warning | Check concurrency and slow SQL. Do not just raise the pool size (replicas × pool must stay under `max_connections`) |
+| `DatabasePoolAcquireFailures` | any acquire error in 5m | 1m | critical | Check PostgreSQL sessions, locks and the CNPG primary |
+| `PostgresExporterDown` | `cnpg_collector_up == 0` | 2m | critical | Check the CNPG instance pods and the operator |
+| `RedisDown` | `redis_up == 0` on any pod | 1m | critical | Check the Redis pod. If it is the primary, confirm Sentinel promoted a replica |
+| `RedisOperationP95High` | client-side p95 > 50 ms | 10m | warning | Check Redis CPU, memory, evictions, AOF rewrite and the network |
+| `RedisPoolAcquisitionTimeouts` | any increase in 5m | 1m | warning | Check pool size against `maxclients` and per-replica connections |
+| `TokenMintFailureSpike` | mint error ratio > 1% | 5m | critical | Look at gRPC status codes and Redis command outcomes |
+| `AuditQueueBacklog` | max(lag) + max(pending) > 1000 | 10m | warning | Consumers are not keeping up: check processing p95 and consumer errors |
+| `AuditQueueStalled` | oldest pending message > 300 s | 5m | warning | Dead consumers are reclaimed after 30 s, so *no* consumer is acknowledging: check the Go pods and `audit_ack_failed` logs |
+| `OtelCollectorExportFailures` | span or log export failures | 10m | warning | Check Loki and Tempo health and the Collector logs. Telemetry is being dropped |
+
+Alertmanager groups alerts by `alertname`, `service` and `namespace` and routes them to a single placeholder webhook
+(`https://example.invalid/...`). Before go-live: route critical alerts to the 24/7 on-call, route warnings to
+the service channel, add inhibition (for example `RedisDown` suppressing `TokenMintFailureSpike`), and test
+delivery end to end.
 
 ## 4. Example investigation runbooks
 
@@ -65,9 +83,18 @@ The initial 99.9% burn-rate rule is an illustrative multi-window pattern. Before
 
 ### Redis unavailable / slow
 
-- Go readiness becomes false when Redis Ping fails; liveness remains healthy so Kubernetes does not restart healthy processes solely because Redis is down.
-- Check managed Redis failover, node CPU/memory, connections, evictions, persistence and network.
-- Validate retry/backoff budget and gRPC caller deadlines. Retries must be bounded and idempotent; do not blindly retry token mint calls without understanding duplicate issuance semantics.
+- Go readiness becomes false when Redis Ping fails. Liveness stays healthy, so Kubernetes does not restart healthy processes just because Redis is down.
+- Ask Sentinel who the primary is: `kubectl exec redis-sentinel-0 -- redis-cli -p 26379 sentinel get-master-addr-by-name mymaster`. Compare that with `redis_instance_info{role="master"}` on the dashboard. A failover completes within about 5 s (down-after) plus the election time. The Go client follows it automatically.
+- A restarted pod asks Sentinel for the primary before starting, so a former primary rejoins as a replica. If no Sentinel answers, it falls back to `redis-0`. Check the Sentinel pods first if roles look wrong.
+- Then check CPU and memory, connections against `maxclients`, evictions, AOF rewrite and the network.
+- Check the retry and backoff budget and the gRPC caller deadlines. Retries must be bounded. Do not blindly retry token mints without deciding how duplicate issuance should behave.
+
+### Audit queue backlog or stalled
+
+- Backlog = `max(redis_stream_lag_messages) + max(redis_stream_pending_messages)`. Lag that grows while pending stays flat means consumers are not reading: check that the Go pods are running and look for `audit_consumer_failed` logs. Pending that grows means messages are read but not acknowledged: look for `audit_ack_failed`.
+- Messages a crashed pod leaves pending are reclaimed by a live consumer after 30 s (`XAUTOCLAIM`). An oldest pending age above 300 s therefore means no healthy consumer exists.
+- Inspect directly: `XINFO GROUPS token:events` and `XPENDING token:events audit`. The stream is capped at about 10,000 entries, so a long consumer outage drops the oldest *unread* events. Restore consumers before the lag approaches that cap.
+- Token issuance is unaffected because publishing is best-effort. `redis_operations_total{operation="xadd",status="error"}` shows events lost at publish time.
 
 ### Telemetry backend/Collector failure
 
@@ -113,8 +140,10 @@ The initial 99.9% burn-rate rule is an illustrative multi-window pattern. Before
 
 ### Delivery and ownership
 
-- [ ] Define dev/stage/prod Kustomize overlays and promotion workflow; pin immutable image digests.
-- [ ] Use GitOps (ArgoCD/Flux) or controlled deployment pipeline with approvals, drift detection and rollback.
+- [x] Define dev/staging/production Kustomize overlays (`k8s/overlays/`).
+- [ ] Define the promotion workflow; pin immutable image digests.
+- [x] GitOps reconciliation with drift correction (Argo CD `selfHeal` for dev and staging; manual sync for production).
+- [ ] Production approvals and rollback procedure on top of the Argo CD Applications.
 - [ ] Add canary/blue-green rollout, automated smoke tests, rollback gates and database backward-compatible migration strategy.
 - [ ] Define ownership, on-call, escalation, incident severity, postmortem and operational readiness review.
 
@@ -124,26 +153,4 @@ The initial 99.9% burn-rate rule is an illustrative multi-window pattern. Before
 - Go Redis client uses a pool size of 50 per Go process; with 10 replicas, potential client connections can approach 500. Validate against Redis `maxclients` and connection usage.
 - HPA CPU 70% is an initial scale trigger, not a performance SLO. Test burst, steady-state and failure-mode load. Scale on useful demand signals, but avoid autoscaling on a noisy latency metric that can create positive feedback.
 - Resource limits are starting values. Benchmark actual RSS/CPU and adjust after representative workload tests; OOMKills and throttling are operational signals.
-
-## Review follow-up status
-
-The repository has implemented these principal-review improvements:
-
-- Separate Kustomize roots for Python, Go and shared platform resources.
-- ConfigMap hash suffixes instead of `disableNameSuffixHash: true`.
-- Preferred topology spreading and pod anti-affinity for Python and Go.
-- Default-deny ingress and egress with explicit dependency and observability allowlists.
-- Redis exporter metrics for Compose and Kubernetes.
-- Optional application-managed gRPC mTLS with a plaintext local-demo fallback.
-- CI Kubernetes render/schema validation.
-
-The following items remain production prerequisites: managed HA data services, tested restore/failover, external secret management, certificate rotation, actual on-call routing, integration/load tests, database migrations and service/protobuf contract governance.
-
-## HA and GitOps implementation status
-
-- PostgreSQL is deployed through CloudNativePG as a three-instance cluster. Install and monitor the operator before applying the platform root.
-- Redis runs as three data replicas with three Sentinel processes. Validate automatic promotion and update application connection settings during failover drills.
-- Dev, staging and production overlays isolate namespaces and environment image/replica settings.
-- Argo CD can reconcile each environment independently; production automation should require approval and image-digest promotion.
-- Database initialization is executed by a versioned migration Job; migration changes must be backward compatible before application rollout.
-- Alertmanager receives Prometheus notifications, but the placeholder webhook must be replaced with an approved GEANT notification route.
+- The audit stream holds at most about 10,000 entries. At sustained peak mint rate R per second, that covers roughly 10,000 / R seconds of consumer outage before unread events are trimmed. Size the cap from the measured peak rate.

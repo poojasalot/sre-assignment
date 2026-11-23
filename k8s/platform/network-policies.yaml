@@ -1,0 +1,249 @@
+# Default deny in both directions, then one policy per component listing exactly what it may
+# receive and send. Kubelet probes are always allowed (node-local traffic), and kubectl
+# port-forward enters the pod directly, so neither needs a rule.
+# Flows that leave the namespace: DNS (kube-system), the Kubernetes API (Prometheus discovery,
+# CloudNativePG instance manager), the CNPG operator (cnpg-system), ingress-nginx, and the
+# Alertmanager notification webhook.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: sre-platform
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: sre-platform
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: python-token-service
+  namespace: sre-platform
+spec:
+  podSelector: {matchLabels: {app: python-token-service}}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ingress-nginx}}
+        - podSelector: {matchLabels: {app: prometheus}}
+      ports: [{protocol: TCP, port: 8000}]
+  egress:
+    - to: [{podSelector: {matchLabels: {cnpg.io/cluster: postgres}}}]
+      ports: [{protocol: TCP, port: 5432}]
+    - to: [{podSelector: {matchLabels: {app: go-token-service}}}]
+      ports: [{protocol: TCP, port: 50051}]
+    - to: [{podSelector: {matchLabels: {app: otel-collector}}}]
+      ports: [{protocol: TCP, port: 4317}, {protocol: TCP, port: 4318}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: go-token-service
+  namespace: sre-platform
+spec:
+  podSelector: {matchLabels: {app: go-token-service}}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from: [{podSelector: {matchLabels: {app: python-token-service}}}]
+      ports: [{protocol: TCP, port: 50051}]
+    - from: [{podSelector: {matchLabels: {app: prometheus}}}]
+      ports: [{protocol: TCP, port: 9090}]
+  egress:
+    - to: [{podSelector: {matchLabels: {app: redis}}}]
+      ports: [{protocol: TCP, port: 6379}]
+    - to: [{podSelector: {matchLabels: {app: redis-sentinel}}}]
+      ports: [{protocol: TCP, port: 26379}]
+    - to: [{podSelector: {matchLabels: {app: otel-collector}}}]
+      ports: [{protocol: TCP, port: 4317}, {protocol: TCP, port: 4318}]
+---
+# CloudNativePG: streaming replication between instances, operator -> instance manager (8000),
+# instance manager -> Kubernetes API, Prometheus -> metrics exporter (9187).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres
+  namespace: sre-platform
+spec:
+  podSelector: {matchLabels: {cnpg.io/cluster: postgres}}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from: [{podSelector: {matchLabels: {app: python-token-service}}}]
+      ports: [{protocol: TCP, port: 5432}]
+    - from: [{podSelector: {matchLabels: {cnpg.io/cluster: postgres}}}]
+      ports: [{protocol: TCP, port: 5432}, {protocol: TCP, port: 8000}]
+    - from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: cnpg-system}}}]
+      ports: [{protocol: TCP, port: 5432}, {protocol: TCP, port: 8000}]
+    - from: [{podSelector: {matchLabels: {app: prometheus}}}]
+      ports: [{protocol: TCP, port: 9187}]
+  egress:
+    - to: [{podSelector: {matchLabels: {cnpg.io/cluster: postgres}}}]
+      ports: [{protocol: TCP, port: 5432}, {protocol: TCP, port: 8000}]
+    - ports: [{protocol: TCP, port: 443}, {protocol: TCP, port: 6443}]  # Kubernetes API
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis
+  namespace: sre-platform
+spec:
+  podSelector: {matchLabels: {app: redis}}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector: {matchLabels: {app: go-token-service}}
+        - podSelector: {matchLabels: {app: redis}}
+        - podSelector: {matchLabels: {app: redis-sentinel}}
+      ports: [{protocol: TCP, port: 6379}]
+    - from: [{podSelector: {matchLabels: {app: prometheus}}}]
+      ports: [{protocol: TCP, port: 9121}]
+  egress:
+    - to: [{podSelector: {matchLabels: {app: redis}}}]  # replica -> primary
+      ports: [{protocol: TCP, port: 6379}]
+    - to: [{podSelector: {matchLabels: {app: redis-sentinel}}}]  # primary discovery at start-up
+      ports: [{protocol: TCP, port: 26379}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-sentinel
+  namespace: sre-platform
+spec:
+  podSelector: {matchLabels: {app: redis-sentinel}}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector: {matchLabels: {app: go-token-service}}
+        - podSelector: {matchLabels: {app: redis}}
+        - podSelector: {matchLabels: {app: redis-sentinel}}
+      ports: [{protocol: TCP, port: 26379}]
+  egress:
+    - to: [{podSelector: {matchLabels: {app: redis}}}]
+      ports: [{protocol: TCP, port: 6379}]
+    - to: [{podSelector: {matchLabels: {app: redis-sentinel}}}]
+      ports: [{protocol: TCP, port: 26379}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: otel-collector
+  namespace: sre-platform
+spec:
+  podSelector: {matchLabels: {app: otel-collector}}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector: {matchLabels: {app: python-token-service}}
+        - podSelector: {matchLabels: {app: go-token-service}}
+      ports: [{protocol: TCP, port: 4317}, {protocol: TCP, port: 4318}]
+    - from: [{podSelector: {matchLabels: {app: prometheus}}}]
+      ports: [{protocol: TCP, port: 8888}]
+  egress:
+    - to: [{podSelector: {matchLabels: {app: tempo}}}]
+      ports: [{protocol: TCP, port: 4317}]
+    - to: [{podSelector: {matchLabels: {app: loki}}}]
+      ports: [{protocol: TCP, port: 3100}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: loki
+  namespace: sre-platform
+spec:
+  podSelector: {matchLabels: {app: loki}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {matchLabels: {app: otel-collector}}
+        - podSelector: {matchLabels: {app: grafana}}
+      ports: [{protocol: TCP, port: 3100}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tempo
+  namespace: sre-platform
+spec:
+  podSelector: {matchLabels: {app: tempo}}
+  policyTypes: [Ingress]
+  ingress:
+    - from: [{podSelector: {matchLabels: {app: otel-collector}}}]
+      ports: [{protocol: TCP, port: 4317}]
+    - from: [{podSelector: {matchLabels: {app: grafana}}}]
+      ports: [{protocol: TCP, port: 3200}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prometheus
+  namespace: sre-platform
+spec:
+  podSelector: {matchLabels: {app: prometheus}}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from: [{podSelector: {matchLabels: {app: grafana}}}]
+      ports: [{protocol: TCP, port: 9090}]
+  egress:
+    - to: [{podSelector: {matchLabels: {app: python-token-service}}}]
+      ports: [{protocol: TCP, port: 8000}]
+    - to: [{podSelector: {matchLabels: {app: go-token-service}}}]
+      ports: [{protocol: TCP, port: 9090}]
+    - to: [{podSelector: {matchLabels: {app: otel-collector}}}]
+      ports: [{protocol: TCP, port: 8888}]
+    - to: [{podSelector: {matchLabels: {app: redis}}}]
+      ports: [{protocol: TCP, port: 9121}]
+    - to: [{podSelector: {matchLabels: {cnpg.io/cluster: postgres}}}]
+      ports: [{protocol: TCP, port: 9187}]
+    - to: [{podSelector: {matchLabels: {app: alertmanager}}}]
+      ports: [{protocol: TCP, port: 9093}]
+    - ports: [{protocol: TCP, port: 443}, {protocol: TCP, port: 6443}]  # Kubernetes API (service discovery)
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: alertmanager
+  namespace: sre-platform
+spec:
+  podSelector: {matchLabels: {app: alertmanager}}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector: {matchLabels: {app: prometheus}}
+        - podSelector: {matchLabels: {app: grafana}}
+      ports: [{protocol: TCP, port: 9093}]
+  egress:
+    - ports: [{protocol: TCP, port: 443}]  # notification webhook (HTTPS)
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: grafana
+  namespace: sre-platform
+spec:
+  podSelector: {matchLabels: {app: grafana}}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ingress-nginx}}}]
+      ports: [{protocol: TCP, port: 3000}]
+  egress:
+    - to: [{podSelector: {matchLabels: {app: prometheus}}}]
+      ports: [{protocol: TCP, port: 9090}]
+    - to: [{podSelector: {matchLabels: {app: loki}}}]
+      ports: [{protocol: TCP, port: 3100}]
+    - to: [{podSelector: {matchLabels: {app: tempo}}}]
+      ports: [{protocol: TCP, port: 3200}]
+    - to: [{podSelector: {matchLabels: {app: alertmanager}}}]
+      ports: [{protocol: TCP, port: 9093}]

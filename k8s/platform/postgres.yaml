@@ -1,0 +1,29 @@
+# Requires the CloudNativePG operator (scripts/install-cnpg.sh). The operator creates the
+# postgres-rw / postgres-ro Services and the postgres-app Secret whose `uri` key the API uses.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: postgres
+  namespace: sre-platform
+spec:
+  instances: 3
+  imageName: ghcr.io/cloudnative-pg/postgresql:16
+  primaryUpdateStrategy: unsupervised
+  bootstrap:
+    initdb:
+      database: tokendb
+      owner: app
+      # Runs once, as superuser, in tokendb. The app role only gets read access to the schema.
+      postInitApplicationSQLRefs:
+        configMapRefs:
+          - {name: token-db-schema, key: init.sql}
+          - {name: token-db-schema, key: grants.sql}
+  storage:
+    size: 10Gi
+  resources:
+    requests: {cpu: 250m, memory: 256Mi}
+    limits: {cpu: "1", memory: 1Gi}
+  affinity:
+    enablePodAntiAffinity: true
+    topologyKey: kubernetes.io/hostname
+    podAntiAffinityType: required

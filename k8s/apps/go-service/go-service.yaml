@@ -6,8 +6,6 @@ metadata:
   annotations:
     prometheus.io/scrape: "true"
     prometheus.io/path: /metrics
-    prometheus.io/port: "9090"
-    prometheus.io/port-name: metrics
 spec:
   selector: {app: go-token-service}
   ports:
@@ -20,7 +18,7 @@ metadata:
   name: go-token-service
   namespace: sre-platform
 spec:
-  replicas: 2
+  # Replica count is owned by the HorizontalPodAutoscaler (minReplicas is set per overlay).
   selector:
     matchLabels: {app: go-token-service}
   template:

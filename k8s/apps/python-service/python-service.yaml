@@ -6,8 +6,6 @@ metadata:
   annotations:
     prometheus.io/scrape: "true"
     prometheus.io/path: /metrics
-    prometheus.io/port: "8000"
-    prometheus.io/port-name: http
 spec:
   selector: {app: python-token-service}
   ports: [{name: http, port: 8000, targetPort: http}]
@@ -18,7 +16,7 @@ metadata:
   name: python-token-service
   namespace: sre-platform
 spec:
-  replicas: 2
+  # Replica count is owned by the HorizontalPodAutoscaler (minReplicas is set per overlay).
   selector:
     matchLabels: {app: python-token-service}
   template:
@@ -39,10 +37,9 @@ spec:
           envFrom:
             - configMapRef: {name: platform-config}
           env:
-            - name: POSTGRES_PASSWORD
-              valueFrom: {secretKeyRef: {name: platform-secrets, key: POSTGRES_PASSWORD}}
+            # Created by CloudNativePG for the least-privilege `app` role; points at postgres-rw.
             - name: DATABASE_URL
-              value: postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@postgres-rw:5432/$(POSTGRES_DB)
+              valueFrom: {secretKeyRef: {name: postgres-app, key: uri}}
           resources:
             requests: {cpu: 200m, memory: 256Mi}
             limits: {cpu: "1", memory: 768Mi}

@@ -85,11 +85,11 @@ var (
 	})
 )
 
+const serviceName = "go-token-service"
+
+// redisStore is satisfied by *redis.Client in both single-node and Sentinel (failover) mode.
 type redisStore interface {
-	Set(context.Context, string, interface{}, time.Duration) *redis.StatusCmd
-	Get(context.Context, string) *redis.StringCmd
-	Ping(context.Context) *redis.StatusCmd
-	DBSize(context.Context) *redis.IntCmd
+	redis.Cmdable
 	Close() error
 }
 
@@ -97,7 +97,7 @@ func initOtel() func() {
 	ctx := context.Background()
 	res, err := resource.New(ctx,
 		resource.WithAttributes(
-			semconv.ServiceName("go-token-service"),
+			semconv.ServiceName(serviceName),
 			semconv.ServiceVersion(envOr("SERVICE_VERSION", "1.0.0")),
 			attribute.String("deployment.environment.name", envOr("DEPLOYMENT_ENVIRONMENT", "development")),
 		),
@@ -140,7 +140,7 @@ func initOtel() func() {
 	otel.SetTracerProvider(tp)
 	otel.SetTextMapPropagator(propagation.TraceContext{})
 	global.SetLoggerProvider(lp)
-	otelLogger = otelslog.NewLogger("go-token-service")
+	otelLogger = otelslog.NewLogger(serviceName)
 	return func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -208,7 +208,7 @@ func metricsUnaryInterceptor(ctx context.Context, req interface{}, info *grpc.Un
 func observeRedis(ctx context.Context, operation string, fn func(context.Context) error) error {
 	// Use a sanitised client span rather than recording the raw Redis command.
 	// SET/GET arguments contain opaque tokens and user identifiers.
-	opCtx, span := otel.Tracer("go-token-service").Start(
+	opCtx, span := otel.Tracer(serviceName).Start(
 		ctx,
 		"redis."+operation,
 		trace.WithSpanKind(trace.SpanKindClient),
@@ -236,7 +236,8 @@ func observeRedis(ctx context.Context, operation string, fn func(context.Context
 
 type server struct {
 	pb.UnimplementedTokenServiceServer
-	rdb redisStore
+	rdb   redisStore
+	audit *auditQueue
 }
 
 func (s *server) MintToken(ctx context.Context, req *pb.MintTokenRequest) (*pb.MintTokenResponse, error) {
@@ -266,6 +267,11 @@ func (s *server) MintToken(ctx context.Context, req *pb.MintTokenRequest) (*pb.M
 		tokensTotal.WithLabelValues("error").Inc()
 		logError(ctx, "redis_token_write_failed", "error", err.Error())
 		return nil, status.Error(grpcCodes.Unavailable, "token storage unavailable")
+	}
+
+	// The audit trail is best effort: a failed enqueue must not fail an issued token.
+	if err := s.audit.publish(ctx, len(req.Permissions), req.TtlSeconds); err != nil {
+		logWarn(ctx, "audit_event_publish_failed", "error", err.Error())
 	}
 
 	tokensTotal.WithLabelValues("success").Inc()
@@ -359,18 +365,19 @@ func collectRedisDBSize(ctx context.Context, rdb redisStore) {
 	}
 }
 
-func grpcServerCredentials() (credentials.TransportCredentials, string) {
+// grpcServerCredentials returns nil (plaintext local demo) unless GRPC_TLS_SERVER_CERT/KEY are set.
+// Once TLS is requested, any certificate problem is fatal: it never falls back to plaintext.
+// GRPC_TLS_CA_CERT additionally requires and verifies client certificates (mTLS).
+func grpcServerCredentials() (credentials.TransportCredentials, error) {
 	serverCert := os.Getenv("GRPC_TLS_SERVER_CERT")
 	serverKey := os.Getenv("GRPC_TLS_SERVER_KEY")
 	clientCA := os.Getenv("GRPC_TLS_CA_CERT")
-	if serverCert == "" || serverKey == "" {
-		return nil, "plaintext_demo"
+	if serverCert == "" && serverKey == "" && clientCA == "" {
+		return nil, nil
 	}
-
 	certificate, err := tls.LoadX509KeyPair(serverCert, serverKey)
 	if err != nil {
-		logError(context.Background(), "grpc_tls_certificate_load_failed", "error", err.Error())
-		return nil, "plaintext_demo"
+		return nil, fmt.Errorf("load gRPC server certificate: %w", err)
 	}
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{certificate},
@@ -379,24 +386,32 @@ func grpcServerCredentials() (credentials.TransportCredentials, string) {
 	if clientCA != "" {
 		caPEM, err := os.ReadFile(clientCA)
 		if err != nil {
-			logError(context.Background(), "grpc_tls_ca_load_failed", "error", err.Error())
-			return nil, "plaintext_demo"
+			return nil, fmt.Errorf("read gRPC client CA: %w", err)
 		}
 		pool := x509.NewCertPool()
 		if !pool.AppendCertsFromPEM(caPEM) {
-			logError(context.Background(), "grpc_tls_ca_invalid")
-			return nil, "plaintext_demo"
+			return nil, errors.New("GRPC_TLS_CA_CERT contains no valid certificates")
 		}
 		tlsConfig.ClientCAs = pool
 		tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
 	}
-	return credentials.NewTLS(tlsConfig), "tls"
+	return credentials.NewTLS(tlsConfig), nil
 }
 
 func main() {
 	logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	cleanupOtel := initOtel()
 	defer cleanupOtel()
+
+	transportCredentials, err := grpcServerCredentials()
+	if err != nil {
+		logError(context.Background(), "grpc_tls_config_invalid", "error", err.Error())
+		os.Exit(1)
+	}
+	transportMode := "plaintext_demo"
+	if transportCredentials != nil {
+		transportMode = "tls"
+	}
 
 	redisAddr := envOr("REDIS_ADDR", "localhost:6379")
 	redisPassword := os.Getenv("REDIS_PASSWORD")
@@ -426,6 +441,11 @@ func main() {
 	httpServer := startMetricsAndHealthServer(rdb)
 	collectorCtx, cancelCollector := context.WithCancel(context.Background())
 	go collectRedisDBSize(collectorCtx, rdb)
+	hostname, _ := os.Hostname()
+	audit := &auditQueue{rdb: rdb, consumer: hostname}
+	prometheus.MustRegister(newStreamCollector(rdb))
+	auditDone := make(chan struct{})
+	go func() { audit.run(collectorCtx); close(auditDone) }()
 
 	lis, err := net.Listen("tcp", ":50051")
 	if err != nil {
@@ -434,7 +454,6 @@ func main() {
 		_ = rdb.Close()
 		os.Exit(1)
 	}
-	transportCredentials, transportMode := grpcServerCredentials()
 	serverOptions := []grpc.ServerOption{
 		grpc.StatsHandler(otelgrpc.NewServerHandler()),
 		grpc.UnaryInterceptor(metricsUnaryInterceptor),
@@ -443,7 +462,7 @@ func main() {
 		serverOptions = append(serverOptions, grpc.Creds(transportCredentials))
 	}
 	grpcServer := grpc.NewServer(serverOptions...)
-	pb.RegisterTokenServiceServer(grpcServer, &server{rdb: rdb})
+	pb.RegisterTokenServiceServer(grpcServer, &server{rdb: rdb, audit: audit})
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- grpcServer.Serve(lis) }()
@@ -471,6 +490,7 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = httpServer.Shutdown(shutdownCtx)
+	<-auditDone
 	if err := rdb.Close(); err != nil {
 		logWarn(context.Background(), "redis_close_failed", "error", fmt.Sprint(err))
 	}

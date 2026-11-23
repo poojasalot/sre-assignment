@@ -1,3 +1,4 @@
+# `$$` escapes Grafana's environment-variable expansion in provisioning files.
 apiVersion: 1
 datasources:
   - name: Prometheus
@@ -6,13 +7,36 @@ datasources:
     access: proxy
     url: http://prometheus:9090
     isDefault: true
+
   - name: Loki
     uid: loki
     type: loki
     access: proxy
     url: http://loki:3100
+    jsonData:
+      # OTLP logs carry trace_id as structured metadata; turn it into a link to the Tempo trace.
+      derivedFields:
+        - name: TraceID
+          matcherType: label
+          matcherRegex: trace_id
+          datasourceUid: tempo
+          url: "$${__value.raw}"
+          urlDisplayLabel: View trace
+
   - name: Tempo
     uid: tempo
     type: tempo
     access: proxy
     url: http://tempo:3200
+    jsonData:
+      # "Logs for this span/trace" button: every log line from both services with this trace ID.
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: -5m
+        spanEndTimeShift: 5m
+        customQuery: true
+        query: '{service_name=~"python-token-service|go-token-service"} | trace_id="$${__trace.traceId}"'
+      lokiSearch:
+        datasourceUid: loki
+      nodeGraph:
+        enabled: true

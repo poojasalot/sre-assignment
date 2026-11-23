@@ -1,0 +1,63 @@
+rule_files:
+  - alert-rules.yml
+evaluation_interval: 1m
+
+tests:
+  - name: 5% Python errors page via the fast burn rate
+    interval: 1m
+    input_series:
+      - series: 'http_server_requests_total{job="python-token-service",method="POST",route="/token",status_code="200"}'
+        values: '0+95x120'
+      - series: 'http_server_requests_total{job="python-token-service",method="POST",route="/token",status_code="503"}'
+        values: '0+5x120'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: PythonAvailabilityFastBurn
+        exp_alerts:
+          - exp_labels: {severity: critical, team: sre, slo: availability, job: python-token-service}
+            exp_annotations:
+              summary: Python API is rapidly burning its availability error budget
+              description: 1h and 5m 5xx ratios both exceed 14.4x the 99.9% budget (about 2% of the monthly budget per hour).
+
+  - name: client errors (404) do not burn the availability budget
+    interval: 1m
+    input_series:
+      - series: 'http_server_requests_total{job="python-token-service",method="POST",route="/token",status_code="404"}'
+        values: '0+50x120'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: PythonAvailabilityFastBurn
+        exp_alerts: []
+
+  - name: absent targets alert even though up==0 has no series
+    interval: 1m
+    input_series:
+      - series: 'up{job="go-token-service",instance="go:9090"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: PythonServiceAbsent
+        exp_alerts:
+          - exp_labels: {severity: critical, team: sre}
+            exp_annotations:
+              summary: No healthy Python token API target
+              description: Prometheus has no scrapeable python-token-service instance.
+      - eval_time: 10m
+        alertname: GoServiceAbsent
+        exp_alerts: []
+
+  - name: stalled audit message
+    interval: 1m
+    input_series:
+      - series: 'redis_stream_oldest_pending_age_seconds{job="go-token-service",instance="a",stream="token:events"}'
+        values: '400x10'
+      - series: 'redis_stream_oldest_pending_age_seconds{job="go-token-service",instance="b",stream="token:events"}'
+        values: '400x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: AuditQueueStalled
+        exp_alerts:
+          - exp_labels: {severity: warning, team: sre}
+            exp_annotations:
+              summary: Audit message unacknowledged for over 5 minutes
+              description: Live consumers reclaim a dead consumer's messages after 30s, so no consumer is processing or acknowledging; check go-token-service pods, audit_ack_failed logs and XPENDING.

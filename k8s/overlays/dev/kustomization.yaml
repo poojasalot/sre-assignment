@@ -1,3 +1,5 @@
+# Single-node friendly (kind/minikube): one PostgreSQL instance, soft anti-affinity for the
+# Redis/Sentinel pods, one app replica. Used by scripts/kind-e2e.sh.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: sre-platform-dev
@@ -6,12 +8,36 @@ resources:
   - ../../apps/python-service
   - ../../apps/go-service
 images:
-  - name: ghcr.io/your-org/sre-python-service
-    newTag: dev
-  - name: ghcr.io/your-org/sre-go-service
-    newTag: dev
-replicas:
-  - name: python-token-service
-    count: 1
-  - name: go-token-service
-    count: 1
+  - {name: ghcr.io/your-org/sre-python-service, newTag: dev}
+  - {name: ghcr.io/your-org/sre-go-service, newTag: dev}
+patches:
+  - target: {kind: ConfigMap, name: platform-config}
+    patch: |-
+      - {op: replace, path: /data/DEPLOYMENT_ENVIRONMENT, value: dev}
+  - target: {kind: HorizontalPodAutoscaler}
+    patch: |-
+      - {op: replace, path: /spec/minReplicas, value: 1}
+  - target: {kind: Cluster, name: postgres}
+    patch: |-
+      - {op: replace, path: /spec/instances, value: 1}
+      - {op: replace, path: /spec/affinity/podAntiAffinityType, value: preferred}
+  - target: {kind: StatefulSet, name: redis}
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/affinity/podAntiAffinity
+        value:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector: {matchLabels: {app: redis}}
+  - target: {kind: StatefulSet, name: redis-sentinel}
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/affinity/podAntiAffinity
+        value:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector: {matchLabels: {app: redis-sentinel}}

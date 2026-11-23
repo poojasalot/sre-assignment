@@ -1,3 +1,4 @@
+# Multi-node cluster: base HA topology (3 PostgreSQL instances, Redis + Sentinel on separate nodes).
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: sre-platform-staging
@@ -5,13 +6,11 @@ resources:
   - ../../platform
   - ../../apps/python-service
   - ../../apps/go-service
-replicas:
-  - name: python-token-service
-    count: 2
-  - name: go-token-service
-    count: 2
+# Promote immutable tags (e.g. the git SHA built by CI), never a moving tag.
 images:
-  - name: ghcr.io/your-org/sre-python-service
-    newTag: staging
-  - name: ghcr.io/your-org/sre-go-service
-    newTag: staging
+  - {name: ghcr.io/your-org/sre-python-service, newTag: 1.0.0}
+  - {name: ghcr.io/your-org/sre-go-service, newTag: 1.0.0}
+patches:
+  - target: {kind: ConfigMap, name: platform-config}
+    patch: |-
+      - {op: replace, path: /data/DEPLOYMENT_ENVIRONMENT, value: staging}

@@ -28,22 +28,38 @@ Open Grafana's SRE dashboard and point out request rate, 5xx ratio, p95 latency,
 
 **4. Show trace and correlated logs (90 seconds).**
 
-- Open Tempo search for `python-token-service`.
-- Open one successful trace and follow HTTP → SQL → gRPC → Go → Redis.
-- Copy the trace ID. Search Loki with `{service_name="python-token-service"} | trace_id="<trace-id>"` and `{service_name="go-token-service"} | trace_id="<trace-id>"`, then show both log records carry the same trace ID.
-- Explain that token/email values are not written to logs.
+- Run `./scripts/validate-observability.sh`. It sends a request with a trace ID it generated, then proves that
+  Tempo has the full trace and that one Loki query returns logs from both services. Use the trace ID it prints.
+- In Tempo, open the trace and follow HTTP → SQL → gRPC → Go → `redis.set` → `redis.xadd`, then the
+  asynchronous `audit.process` → `redis.xack`. The queue consumer joins the same trace because the
+  `traceparent` travels inside the stream message.
+- Click **Logs for this span** to jump to Loki. The query
+  `{service_name=~"python-token-service|go-token-service"} | trace_id="<trace-id>"` shows `token_issued`,
+  `token_minted` and `token_audit_recorded` together. Use a log line's **TraceID** link to jump back to Tempo.
+- Explain that token and email values are never written to logs, span attributes or queue messages.
 
-**5. Show the deployment/safety choices (60-90 seconds).**
+**5. Show the audit queue (45 seconds).**
 
-Show the Dockerfiles, Kubernetes probes/resources, ConfigMap/Secret separation, HPA, PDB and NetworkPolicies. Explain that PostgreSQL uses CloudNativePG and Redis uses Sentinel; production still requires operator operation, tested backups, failover drills and notification routing.
+On the dashboard's audit-queue row, point out depth (lag + pending), oldest pending age and processing p95.
+Explain that publishing is best-effort, so a queue problem never blocks token issuance, and that a live
+consumer reclaims a crashed pod's unacknowledged messages after 30 seconds.
+
+**6. Show the deployment/safety choices (60-90 seconds).**
+
+Show `scripts/kind-e2e.sh`: it deploys the dev overlay to kind with default-deny NetworkPolicies enforced and
+runs a Redis failover drill. Then show the Dockerfiles, probes and resources, ConfigMap and Secret separation,
+HPA, PDB and NetworkPolicies. PostgreSQL uses CloudNativePG and Redis uses Sentinel. Production still needs
+backups, restore drills and a real notification route.
 
 ## 2. 90-second design explanation
 
 > I kept the business flow small and focused the change on service reliability and operability. The Python service validates the request, looks up permissions through a bounded PostgreSQL pool, then calls the Go service over a reused gRPC channel with a deadline. The Go service generates a cryptographically random opaque token and stores it in Redis with an explicit TTL. Dependency failures are mapped to clear 503/504 responses or gRPC Unavailable rather than being treated as success.
 >
-> For observability, I instrumented HTTP and gRPC RED metrics and the actual dependencies: PostgreSQL pool acquisition and utilisation, Redis operation latency/errors and pool/key statistics. OpenTelemetry propagates W3C trace context from FastAPI through PostgreSQL and gRPC into Redis. Both services emit JSON logs with trace and span IDs; OTLP logs and traces go through a Collector into Loki and Tempo, while Prometheus scrapes metrics and Grafana provisions the dashboard.
+> Each mint also publishes an audit event to a Redis Stream, which a consumer group processes and acknowledges asynchronously. That gives the platform a real queue with measurable depth, oldest-message age and processing time.
 >
-> On Kubernetes, I added separate liveness/readiness probes, resource requests and limits, ConfigMaps and Secrets, two replicas for stateless services, HPAs, PDBs and network policies. PostgreSQL is represented as a three-instance CloudNativePG cluster and Redis as a Sentinel topology. Remaining production work includes operator/backup ownership, live failover evidence, external secrets, TLS/mTLS and real Alertmanager routing.
+> For observability, I instrumented HTTP and gRPC RED metrics and the actual dependencies: PostgreSQL pool acquisition and utilisation, Redis operation latency and errors, and the queue. OpenTelemetry propagates W3C trace context from FastAPI through PostgreSQL and gRPC into Redis, and on through the queue. Both services emit JSON logs with trace and span IDs. OTLP logs and traces go through a Collector into Loki and Tempo, Prometheus scrapes metrics, and Grafana links logs to traces in both directions. A script proves this for one trace ID.
+>
+> On Kubernetes, the stateless services have probes, resource limits, HPAs, PDBs and default-deny network policies. PostgreSQL is a three-instance CloudNativePG cluster and Redis is a Sentinel topology. Kubernetes config is generated from the same files Compose uses, so the two cannot drift. A kind end-to-end test with a Redis failover drill is in CI. Remaining production work is backups and restore drills, external secrets, mandatory mTLS and a real Alertmanager route.
 
 ## 3. Good answers to likely follow-ups
 
@@ -75,6 +91,8 @@ Define the RTO/RPO and consistency requirements first. Decide if token validity/
 
 - A trace/log may take a few seconds to appear because OTLP export is batched.
 - Prometheus/Grafana latency percentile panels require sufficient request observations.
-- The assignment has no queue, so Redis queue depth and worker processing time are not implemented; real command duration/error metrics are present.
-- Kubernetes HPA requires metrics-server; NetworkPolicies require a policy-enforcing CNI; inbound app/Grafana access assumes an `ingress-nginx` controller or port-forward.
-- PostgreSQL and Redis are HA-capable Kubernetes designs through CloudNativePG and Sentinel. Operator setup, PVC storage, backup/restore, failover and live trace verification should be stated as cluster-dependent rather than assumed from static manifests.
+- The audit queue is a deliberate addition. The starter had no queue, so "queue depth" needed a real queue to measure. Publishing is best-effort, so a queue problem never blocks token issuance.
+- Queue depth gauges are read from Redis at scrape time and are group-wide, so dashboards use `max()` across replicas, not `sum()`.
+- The Compose integration test and the kind end-to-end test are in CI but had not been run locally when this was written (no Docker). Say so if asked, and show the CI run instead.
+- Kubernetes HPAs need metrics-server. NetworkPolicies need a CNI that enforces them (kind's does). Access is by port-forward until an Ingress is added.
+- PostgreSQL and Redis HA is exercised by the kind end-to-end test. Backups and restore drills still need object storage and an agreed RPO/RTO.

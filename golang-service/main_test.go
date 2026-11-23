@@ -12,8 +12,11 @@ import (
 	pb "token-service/proto"
 )
 
+// fakeRedis implements the commands the token handlers use; other redis.Cmdable methods are unused.
 type fakeRedis struct {
+	redis.Cmdable
 	values map[string]string
+	events []map[string]any
 	setErr error
 	getErr error
 }
@@ -40,11 +43,19 @@ func (f *fakeRedis) Ping(context.Context) *redis.StatusCmd { return redis.NewSta
 func (f *fakeRedis) DBSize(context.Context) *redis.IntCmd {
 	return redis.NewIntResult(int64(len(f.values)), nil)
 }
+func (f *fakeRedis) XAdd(_ context.Context, args *redis.XAddArgs) *redis.StringCmd {
+	f.events = append(f.events, args.Values.(map[string]any))
+	return redis.NewStringResult("1-0", nil)
+}
 func (f *fakeRedis) Close() error { return nil }
+
+func newTestServer(store *fakeRedis) *server {
+	return &server{rdb: store, audit: &auditQueue{rdb: store, consumer: "test"}}
+}
 
 func TestMintTokenStoresOpaqueToken(t *testing.T) {
 	store := newFakeRedis()
-	svc := &server{rdb: store}
+	svc := newTestServer(store)
 	response, err := svc.MintToken(context.Background(), &pb.MintTokenRequest{
 		UserEmail: "ALICE@example.com", Permissions: []string{"read:data"}, TtlSeconds: 3600,
 	})
@@ -57,10 +68,13 @@ func TestMintTokenStoresOpaqueToken(t *testing.T) {
 	if got := store.values["token:"+response.Token]; got != "alice@example.com" {
 		t.Fatalf("token maps to %q, want normalized email", got)
 	}
+	if len(store.events) != 1 || store.events[0]["event"] != "token_minted" || store.events[0]["permission_count"] != 1 {
+		t.Fatalf("expected one token_minted audit event, got %#v", store.events)
+	}
 }
 
 func TestMintTokenRejectsInvalidTTL(t *testing.T) {
-	svc := &server{rdb: newFakeRedis()}
+	svc := newTestServer(newFakeRedis())
 	_, err := svc.MintToken(context.Background(), &pb.MintTokenRequest{UserEmail: "a@b.co", TtlSeconds: 0})
 	if status.Code(err) != grpcCodes.InvalidArgument {
 		t.Fatalf("got %v, want InvalidArgument", err)
@@ -70,7 +84,7 @@ func TestMintTokenRejectsInvalidTTL(t *testing.T) {
 func TestMintTokenMapsRedisFailureToUnavailable(t *testing.T) {
 	store := newFakeRedis()
 	store.setErr = context.DeadlineExceeded
-	svc := &server{rdb: store}
+	svc := newTestServer(store)
 	_, err := svc.MintToken(context.Background(), &pb.MintTokenRequest{UserEmail: "a@b.co", TtlSeconds: 30})
 	if status.Code(err) != grpcCodes.Unavailable {
 		t.Fatalf("got %v, want Unavailable", err)
@@ -80,7 +94,7 @@ func TestMintTokenMapsRedisFailureToUnavailable(t *testing.T) {
 func TestValidateTokenFoundAndMissing(t *testing.T) {
 	store := newFakeRedis()
 	store.values["token:known"] = "alice@example.com"
-	svc := &server{rdb: store}
+	svc := newTestServer(store)
 	valid, err := svc.ValidateToken(context.Background(), &pb.ValidateTokenRequest{Token: "known"})
 	if err != nil || !valid.Valid || valid.UserEmail != "alice@example.com" {
 		t.Fatalf("unexpected valid response: %#v, %v", valid, err)
@@ -94,12 +108,27 @@ func TestValidateTokenFoundAndMissing(t *testing.T) {
 func TestValidateTokenMapsRedisFailureToUnavailable(t *testing.T) {
 	store := newFakeRedis()
 	store.getErr = context.DeadlineExceeded
-	svc := &server{rdb: store}
+	svc := newTestServer(store)
 	_, err := svc.ValidateToken(context.Background(), &pb.ValidateTokenRequest{Token: "x"})
 	if status.Code(err) != grpcCodes.Unavailable {
 		t.Fatalf("got %v, want Unavailable", err)
 	}
 	if !strings.Contains(err.Error(), "token storage unavailable") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestGRPCServerCredentialsFailsClosed(t *testing.T) {
+	if creds, err := grpcServerCredentials(); creds != nil || err != nil {
+		t.Fatalf("no TLS variables must mean plaintext, got %v, %v", creds, err)
+	}
+	t.Setenv("GRPC_TLS_CA_CERT", "/run/tls/ca.crt")
+	if creds, err := grpcServerCredentials(); creds != nil || err == nil {
+		t.Fatalf("a client CA without a server certificate must be an error")
+	}
+	t.Setenv("GRPC_TLS_SERVER_CERT", "/nonexistent/tls.crt")
+	t.Setenv("GRPC_TLS_SERVER_KEY", "/nonexistent/tls.key")
+	if creds, err := grpcServerCredentials(); creds != nil || err == nil {
+		t.Fatalf("unreadable certificates must be an error, never a plaintext fallback")
 	}
 }

@@ -1,13 +1,17 @@
+# Demo-sized observability stack: one replica each. Stateful singletons use `Recreate` so a
+# rollout never waits on a ReadWriteOnce volume still attached to the previous pod.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: prometheus
   namespace: sre-platform
 ---
+# Namespaced on purpose: each environment's Prometheus discovers only its own namespace.
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
+kind: Role
 metadata:
-  name: prometheus-sre-platform
+  name: prometheus-discovery
+  namespace: sre-platform
 rules:
   - apiGroups: [""]
     resources: [services, endpoints, pods]
@@ -17,13 +21,14 @@ rules:
     verbs: [get, list, watch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
+kind: RoleBinding
 metadata:
-  name: prometheus-sre-platform
+  name: prometheus-discovery
+  namespace: sre-platform
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: prometheus-sre-platform
+  kind: Role
+  name: prometheus-discovery
 subjects:
   - kind: ServiceAccount
     name: prometheus
@@ -37,8 +42,6 @@ metadata:
   annotations:
     prometheus.io/scrape: "true"
     prometheus.io/path: /metrics
-    prometheus.io/port: "8888"
-    prometheus.io/port-name: telemetry
 spec:
   selector: {app: otel-collector}
   ports:
@@ -72,11 +75,19 @@ spec:
             - {name: otlp-grpc, containerPort: 4317}
             - {name: otlp-http, containerPort: 4318}
             - {name: telemetry, containerPort: 8888}
+            - {name: health, containerPort: 13133}
+          readinessProbe:
+            httpGet: {path: /, port: health}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /, port: health}
+            periodSeconds: 20
           resources:
             requests: {cpu: 100m, memory: 128Mi}
             limits: {cpu: 500m, memory: 512Mi}
           securityContext:
             allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
             capabilities: {drop: [ALL]}
           volumeMounts: [{name: config, mountPath: /conf, readOnly: true}]
       volumes: [{name: config, configMap: {name: otel-collector-config}}]
@@ -97,6 +108,7 @@ metadata:
   namespace: sre-platform
 spec:
   replicas: 1
+  strategy: {type: Recreate}
   selector:
     matchLabels: {app: loki}
   template:
@@ -114,6 +126,10 @@ spec:
           image: grafana/loki:3.7.8
           args: ["-config.file=/etc/loki/loki.yaml"]
           ports: [{name: http, containerPort: 3100}]
+          readinessProbe:
+            httpGet: {path: /ready, port: http}
+            initialDelaySeconds: 10
+            periodSeconds: 10
           resources:
             requests: {cpu: 100m, memory: 256Mi}
             limits: {cpu: "1", memory: 1Gi}
@@ -145,6 +161,7 @@ metadata:
   namespace: sre-platform
 spec:
   replicas: 1
+  strategy: {type: Recreate}
   selector:
     matchLabels: {app: tempo}
   template:
@@ -164,6 +181,10 @@ spec:
           ports:
             - {name: http, containerPort: 3200}
             - {name: otlp-grpc, containerPort: 4317}
+          readinessProbe:
+            httpGet: {path: /ready, port: http}
+            initialDelaySeconds: 10
+            periodSeconds: 10
           resources:
             requests: {cpu: 100m, memory: 256Mi}
             limits: {cpu: "1", memory: 1Gi}
@@ -193,6 +214,7 @@ metadata:
   namespace: sre-platform
 spec:
   replicas: 1
+  strategy: {type: Recreate}
   selector:
     matchLabels: {app: prometheus}
   template:
@@ -214,6 +236,12 @@ spec:
             - --storage.tsdb.path=/prometheus
             - --storage.tsdb.retention.time=7d
           ports: [{name: http, containerPort: 9090}]
+          readinessProbe:
+            httpGet: {path: /-/ready, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /-/healthy, port: http}
+            periodSeconds: 20
           resources:
             requests: {cpu: 200m, memory: 512Mi}
             limits: {cpu: "1", memory: 2Gi}
@@ -223,11 +251,67 @@ spec:
             - {name: data, mountPath: /prometheus}
           securityContext:
             allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
             capabilities: {drop: [ALL]}
       volumes:
         - {name: config, configMap: {name: prometheus-config}}
         - {name: rules, configMap: {name: prometheus-alert-rules}}
         - {name: data, persistentVolumeClaim: {claimName: prometheus-data}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager
+  namespace: sre-platform
+spec:
+  selector: {app: alertmanager}
+  ports: [{name: web, port: 9093, targetPort: 9093}]
+---
+# Single replica: a second one only helps when the two are clustered (--cluster.peer) and
+# Prometheus addresses each directly; otherwise it duplicates notifications.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager
+  namespace: sre-platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: alertmanager}
+  template:
+    metadata:
+      labels: {app: alertmanager}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: alertmanager
+          image: prom/alertmanager:v0.28.1
+          args:
+            - --config.file=/etc/alertmanager/alertmanager.yml
+            - --storage.path=/alertmanager
+          ports: [{name: web, containerPort: 9093}]
+          readinessProbe:
+            httpGet: {path: /-/ready, port: web}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 200m, memory: 256Mi}
+          volumeMounts:
+            - {name: config, mountPath: /etc/alertmanager, readOnly: true}
+            # Silences and the notification log; lost on pod replacement, acceptable for one replica.
+            - {name: data, mountPath: /alertmanager}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+      volumes:
+        - {name: config, configMap: {name: alertmanager-config}}
+        - {name: data, emptyDir: {sizeLimit: 64Mi}}
 ---
 apiVersion: v1
 kind: Service
@@ -245,6 +329,7 @@ metadata:
   namespace: sre-platform
 spec:
   replicas: 1
+  strategy: {type: Recreate}
   selector:
     matchLabels: {app: grafana}
   template:
@@ -262,10 +347,14 @@ spec:
           image: grafana/grafana:13.3.1
           ports: [{name: http, containerPort: 3000}]
           env:
-            - {name: GF_SECURITY_ADMIN_USER, valueFrom: {configMapKeyRef: {name: platform-config, key: GRAFANA_ADMIN_USER}}}
+            - {name: GF_SECURITY_ADMIN_USER, value: admin}
             - {name: GF_SECURITY_ADMIN_PASSWORD, valueFrom: {secretKeyRef: {name: platform-secrets, key: GRAFANA_ADMIN_PASSWORD}}}
             - {name: GF_USERS_ALLOW_SIGN_UP, value: "false"}
+            - {name: GF_ANALYTICS_CHECK_FOR_UPDATES, value: "false"}
             - {name: GF_PATHS_DATA, value: /var/lib/grafana-data}
+          readinessProbe:
+            httpGet: {path: /api/health, port: http}
+            periodSeconds: 10
           resources:
             requests: {cpu: 100m, memory: 256Mi}
             limits: {cpu: 500m, memory: 768Mi}
@@ -282,67 +371,3 @@ spec:
         - {name: providers, configMap: {name: grafana-dashboard-provider}}
         - {name: dashboards, configMap: {name: grafana-dashboard-data}}
         - {name: data, persistentVolumeClaim: {claimName: grafana-data}}
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: alertmanager-config
-  namespace: sre-platform
-data:
-  alertmanager.yml: |
-    global:
-      resolve_timeout: 5m
-    route:
-      receiver: sre-default
-      group_by: [alertname, service, namespace]
-      group_wait: 30s
-      group_interval: 5m
-      repeat_interval: 4h
-    receivers:
-      - name: sre-default
-        webhook_configs:
-          - url: http://example.invalid/replace-with-platform-notification-webhook
-            send_resolved: true
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: alertmanager
-  namespace: sre-platform
-spec:
-  selector: {app: alertmanager}
-  ports: [{name: web, port: 9093, targetPort: 9093}]
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: alertmanager
-  namespace: sre-platform
-spec:
-  replicas: 2
-  selector:
-    matchLabels: {app: alertmanager}
-  template:
-    metadata:
-      labels: {app: alertmanager}
-    spec:
-      securityContext:
-        seccompProfile: {type: RuntimeDefault}
-      containers:
-        - name: alertmanager
-          image: prom/alertmanager:v0.28.1
-          args:
-            - --config.file=/etc/alertmanager/alertmanager.yml
-            - --storage.path=/alertmanager
-          ports: [{name: web, containerPort: 9093}]
-          resources:
-            requests: {cpu: 50m, memory: 64Mi}
-            limits: {cpu: 200m, memory: 256Mi}
-          volumeMounts:
-            - {name: config, mountPath: /etc/alertmanager, readOnly: true}
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities: {drop: [ALL]}
-      volumes:
-        - {name: config, configMap: {name: alertmanager-config}}

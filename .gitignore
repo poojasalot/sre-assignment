@@ -25,7 +25,10 @@ venv/
 .env
 .env.*
 !.env.example
-k8s/secrets.yaml
+
+# Local tool binaries and rendered manifests
+.tools/
+rendered/
 
 # Test artifacts
 .pytest_cache/

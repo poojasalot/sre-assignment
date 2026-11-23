@@ -1,24 +1,42 @@
-# Optional GitOps starting point. Create separate Applications to limit deployment blast radius.
-# Use environment overlays and controlled promotion in a real cluster.
+# Argo CD example: one Application per environment, scoped by an AppProject.
+# Prerequisites:
+#   1. The platform kustomization reads ../../observability and ../../database, so Argo CD must render
+#      with `--load-restrictor LoadRestrictionsNone`. This is a repo-server setting, not an Application
+#      field: set `kustomize.buildOptions: --load-restrictor LoadRestrictionsNone` in the argocd-cm ConfigMap.
+#   2. The CloudNativePG operator is installed and `platform-secrets` exists in each target namespace
+#      (scripts/create-k8s-secrets.sh, or an External Secrets Operator resource in production).
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: sre-token-platform
+  namespace: argocd
+spec:
+  description: Token platform environments
+  sourceRepos: [https://github.com/your-org/sre-token-platform.git]
+  destinations:
+    - {server: https://kubernetes.default.svc, namespace: sre-platform-dev}
+    - {server: https://kubernetes.default.svc, namespace: sre-platform-staging}
+    - {server: https://kubernetes.default.svc, namespace: sre-platform-production}
+  clusterResourceWhitelist:
+    - {group: "", kind: Namespace}
+---
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
   name: sre-token-dev
   namespace: argocd
 spec:
-  project: default
+  project: sre-token-platform
   source:
     repoURL: https://github.com/your-org/sre-token-platform.git
     targetRevision: main
     path: k8s/overlays/dev
-    kustomize:
-      buildOptions: --load-restrictor LoadRestrictionsNone
   destination:
     server: https://kubernetes.default.svc
     namespace: sre-platform-dev
   syncPolicy:
     automated: {prune: true, selfHeal: true}
-    syncOptions: [CreateNamespace=true]
+    syncOptions: [CreateNamespace=true, ServerSideApply=true]
 ---
 apiVersion: argoproj.io/v1alpha1
 kind: Application
@@ -26,36 +44,32 @@ metadata:
   name: sre-token-staging
   namespace: argocd
 spec:
-  project: default
+  project: sre-token-platform
   source:
     repoURL: https://github.com/your-org/sre-token-platform.git
     targetRevision: main
     path: k8s/overlays/staging
-    kustomize:
-      buildOptions: --load-restrictor LoadRestrictionsNone
   destination:
     server: https://kubernetes.default.svc
     namespace: sre-platform-staging
   syncPolicy:
     automated: {prune: true, selfHeal: true}
-    syncOptions: [CreateNamespace=true]
+    syncOptions: [CreateNamespace=true, ServerSideApply=true]
 ---
+# Production has no `automated` block: every sync is a deliberate, reviewed promotion.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
   name: sre-token-production
   namespace: argocd
 spec:
-  project: default
+  project: sre-token-platform
   source:
     repoURL: https://github.com/your-org/sre-token-platform.git
     targetRevision: main
     path: k8s/overlays/production
-    kustomize:
-      buildOptions: --load-restrictor LoadRestrictionsNone
   destination:
     server: https://kubernetes.default.svc
     namespace: sre-platform-production
   syncPolicy:
-    automated: {prune: false, selfHeal: false}
-    syncOptions: [CreateNamespace=true]
+    syncOptions: [CreateNamespace=true, ServerSideApply=true]

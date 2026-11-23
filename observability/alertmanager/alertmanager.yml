@@ -9,5 +9,5 @@ route:
 receivers:
   - name: sre-default
     webhook_configs:
-      - url: http://example.invalid/replace-with-platform-notification-webhook
+      - url: https://example.invalid/replace-with-platform-notification-webhook
         send_resolved: true

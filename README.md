@@ -1,235 +1,300 @@
-# GEANT SRE Lead Assignment - Observable Token Microservices
+# GÉANT SRE Lead Assignment: Observable Token Microservices
 
-This repository extends the supplied FastAPI + Go starter into a containerized, Kubernetes-deployable demo platform with metrics, structured logs, distributed tracing, deployment hardening and operational documentation.
+A FastAPI service issues access tokens: it looks up a user's permissions in PostgreSQL and asks a Go gRPC
+service to mint an opaque token, which Go stores in Redis with a TTL and records on an audit queue (a Redis
+Stream). Both services are containerised, deployable with Docker Compose or Kubernetes (Kustomize +
+Argo CD), and fully instrumented: RED and dependency metrics in Prometheus, JSON logs in Loki and
+distributed traces in Tempo, all correlated by trace ID in Grafana.
 
-> **Scope and honesty:** this is an interview assignment / reference implementation, not a production-ready identity platform. Docker, Compose, Kubernetes, Prometheus, Grafana, Loki and Tempo are configured. Source tests, Docker builds, YAML parsing and Kustomize rendering have been validated locally; live Kubernetes failover, distributed traces and notification delivery require a real cluster and external integrations.
+> **Validation status.** Unit tests, Prometheus rule unit tests, every config file (Prometheus,
+> Alertmanager, OTel Collector, Grafana) and every Kustomize root (strict schema validation including the
+> CloudNativePG and Argo CD CRDs) pass locally. The Compose integration test and the kind end-to-end test
+> (`scripts/kind-e2e.sh`) are wired into CI but need Docker, which was not available where this revision
+> was prepared. See [docs/VALIDATION.md](docs/VALIDATION.md).
+
 ## 1. Architecture
+
+### Request, queue and telemetry flow
 
 ```mermaid
 flowchart LR
-  C[Client] -->|HTTP POST /token| P[Python FastAPI]
-  P -->|SELECT permissions| PG[(PostgreSQL)]
-  P -->|gRPC MintToken<br/>W3C traceparent| G[Go gRPC service]
-  G -->|SET token with TTL| R[(Redis)]
-  P -->|JSON response| C
+  C[Client] -->|POST /token| P[Python FastAPI]
+  P -->|SELECT permissions<br/>bounded pool| PG[(PostgreSQL)]
+  P -->|gRPC MintToken<br/>deadline + traceparent| G[Go token service]
+  G -->|SET token:&lt;id&gt; EX ttl| R[(Redis)]
+  G -->|XADD token:events<br/>traceparent in message| R
+  R -->|XREADGROUP audit| W[Go audit consumer]
+  W -->|XACK| R
 
-  P -. OTLP traces + logs .-> O[OpenTelemetry Collector]
+  P -. OTLP traces + logs .-> O[OTel Collector]
   G -. OTLP traces + logs .-> O
   O --> T[Tempo]
   O --> L[Loki]
-  P -. /metrics .-> PR[Prometheus]
-  G -. /metrics .-> PR
-  PR --> GR[Grafana]
-  T --> GR
-  L --> GR
+  PR[Prometheus] -. scrape .-> P & G & O
+  PR -. scrape .-> RE[redis_exporter]
+  PR --> AM[Alertmanager]
+  GR[Grafana] --> PR & L & T
 ```
 
-**Request path:** the Python API validates the email, reads permissions from PostgreSQL using a bounded connection pool, calls the Go service with a finite gRPC deadline, and returns the generated opaque token. The Go service creates a 256-bit cryptographically-random token, stores `token:<token>` → normalized email in Redis with a bounded TTL, and returns the token. The demo `ValidateToken` RPC reads that mapping.
+1. **Python** validates the email, reads permissions through a bounded `ThreadedConnectionPool`, and calls Go
+   over one reused gRPC channel with a per-call deadline. Unknown users return 404, invalid input 422, and
+   dependency failures 503/504.
+2. **Go** generates a 256-bit random token, stores `token:<token>` with the TTL, then publishes a
+   `token_minted` audit event to the `token:events` stream. Publishing is best-effort: a failure is logged
+   (`audit_event_publish_failed`) and never fails the mint.
+3. **The audit consumer** (a goroutine in every Go replica, consumer group `audit`) reads events, records
+   `token_audit_recorded`, and acknowledges them. Messages left pending by a crashed replica are reclaimed
+   with `XAUTOCLAIM` after 30 s, which gives at-least-once delivery. The stream is capped at about 10,000 entries.
+4. **W3C Trace Context** flows HTTP → psycopg2 → gRPC → Redis and continues *through the queue*: the
+   producer injects `traceparent` into the message and the consumer span `audit.process` joins the same
+   trace.
+5. **Telemetry:** both services export OTLP traces and logs to the Collector, which forwards traces to Tempo
+   and logs to Loki (`service_name` label, `trace_id` structured metadata). Prometheus scrapes the services,
+   Collector, Redis exporter and (in Kubernetes) CloudNativePG. Grafana links Loki to Tempo through the
+   `trace_id` field, and Tempo to Loki through "Logs for this span".
 
-**Telemetry path:** W3C Trace Context is propagated from FastAPI to the PostgreSQL client and gRPC client, then through the Go gRPC server to Redis. Python and Go export OTLP traces and correlated logs to the Collector. The Collector sends traces to Tempo and logs to Loki. Prometheus scrapes application and Collector metrics; Grafana provisions the Prometheus, Loki and Tempo data sources and the platform dashboard.
+### Kubernetes topology
 
-## 2. What is included
+```mermaid
+flowchart TB
+  subgraph ns[namespace sre-platform-ENV &mdash; default-deny ingress + egress]
+    PY[python-token-service<br/>Deployment + HPA + PDB] --> GO[go-token-service<br/>Deployment + HPA + PDB]
+    PY --> RW[postgres-rw Service]
+    RW --> PGC[(CloudNativePG Cluster<br/>3 instances)]
+    GO --> SEN[redis-sentinel<br/>3 pods] -.->|primary address| GO
+    GO --> RS[(redis StatefulSet<br/>1 primary + 2 replicas, AOF on PVC)]
+    PY & GO --> OC[otel-collector] --> LK[loki] & TP[tempo]
+    PM[prometheus] --> AL[alertmanager]
+    GF[grafana]
+  end
+  OP[cnpg-system operator] --> PGC
+```
 
-| Area | Included implementation |
+| Kustomize root | Contents |
 |---|---|
-| Containers | Multi-stage Python and Go Dockerfiles, non-root runtime users, slim/distroless runtime, Compose stack |
-| Kubernetes | Independent app Deployments, CloudNativePG PostgreSQL, Redis/Sentinel, Services, ConfigMaps, Secrets, probes, HPA, PDB and NetworkPolicies |
-| Discovery/config | Kubernetes DNS service names, ConfigMaps for non-sensitive config, Secret references for passwords |
-| Logging | JSON stdout logs with `trace_id` and `span_id`; OTLP log export to Loki through the Collector |
-| Metrics | HTTP RED, gRPC RED, PostgreSQL pool usage/acquire latency/errors, Redis operation rate/errors/latency and Redis key count |
-| Tracing | OpenTelemetry FastAPI, gRPC, psycopg2 and sanitised Redis spans; Tempo backend |
-| Dashboard | Provisioned Grafana dashboard with request rate, errors, latency, pool saturation, Redis latency and token outcomes |
-| Bonus | CI tests/builds, SLO-oriented Prometheus alert rules, HPAs, PDBs, and network policies |
+| `k8s/platform` | Namespace, `platform-config`, CloudNativePG cluster, Redis + Sentinel, observability stack, NetworkPolicies. ConfigMaps are generated from the canonical files in `observability/` and `database/`, so Compose and Kubernetes cannot drift. |
+| `k8s/apps/python-service`, `k8s/apps/go-service` | Each service's Deployment, Service, HPA and PDB. They can be reconciled independently. |
+| `k8s/overlays/{dev,staging,production}` | One namespace per environment, plus image tags and environment patches. The dev overlay runs a single-node topology (1 PostgreSQL instance, soft anti-affinity, `minReplicas: 1`). Production raises `minReplicas` to 3. |
+| `k8s/argocd-application.example.yaml` | An AppProject plus one Application per environment. Dev and staging sync automatically. Production is manual. |
+
+Key Kubernetes behaviours:
+
+- **PostgreSQL:** CloudNativePG creates the database and a least-privilege `app` owner, then runs
+  `database/init.sql` and a read grant through `postInitApplicationSQLRefs`. Python reads `DATABASE_URL` from
+  the operator-generated `postgres-app` Secret (`uri` key), which points at the `postgres-rw` primary Service.
+- **Redis HA:** each Redis pod asks Sentinel for the current primary at startup and joins it as a replica.
+  If it is the primary, it restarts from its AOF volume. Sentinel uses hostname announcements
+  (`announce-hostnames`, `resolve-hostnames`), so pod IP changes do not break it. The Go client discovers the
+  primary through Sentinel and follows failovers.
+- **Network policy:** `default-deny` covers ingress and egress. Each workload then gets an explicit
+  allowlist: DNS, app → dependency, app → Collector, Collector → Loki/Tempo, Prometheus → scrape targets,
+  CNPG operator ↔ instances, and Kubernetes API access for Prometheus discovery and the CNPG instance manager.
+- **Replica ownership:** HPAs own the replica count (Deployments do not set `replicas`), and PDBs protect
+  voluntary disruptions.
+- **Secrets:** `scripts/create-k8s-secrets.sh` creates `platform-secrets` (the Redis and Grafana passwords)
+  with random values. CloudNativePG generates the database credentials. In production, use External Secrets
+  Operator or a CSI secret store.
+
+## 2. Repository layout
+
+```text
+python-service/          FastAPI API, Dockerfile, unit tests
+golang-service/          gRPC token service, audit queue (audit_queue.go), Dockerfile, unit tests
+protos/                  token.proto
+database/init.sql        schema + seed users (used by Compose and CloudNativePG)
+observability/           canonical Prometheus, alert rules (+ unit tests), Alertmanager, OTel Collector,
+                         Loki, Tempo and Grafana provisioning/dashboard
+k8s/                     platform, apps, overlays, Argo CD example
+scripts/                 smoke test, trace/log validation, CNPG install, secrets, kind end-to-end test
+docs/                    assignment coverage, design decisions, operations, demo guide, validation record
+```
 
 ## 3. Run locally with Docker Compose
 
-Prerequisites: Docker Desktop / Docker Engine with Compose v2, and an available local port set (8000, 9090, 9091, 3000, 3100, 3200, 4317, 4318, 50051).
+Prerequisites: Docker with Compose v2, plus free ports 8000, 9090, 9091, 9093, 3000, 3100, 3200, 4317, 4318
+and 50051.
 
 ```bash
 cp .env.example .env
-# Put a different URL-safe random value in each password field; hex is URL-safe.
-openssl rand -hex 32
-# Edit .env with independent generated values before starting.
-docker compose up --build -d
-docker compose ps
-
-# Legacy docker-compose alternative:
-# docker-compose up --build -d
-# docker-compose ps
+# Replace every change-me-local-only value with its own random value, e.g. `openssl rand -hex 32`.
+docker compose up --build -d --wait     # returns once health checks pass
+./scripts/smoke-test.sh                 # liveness, readiness, token for alice, 404 for an unknown user
+./scripts/validate-observability.sh     # proves one trace ID across Tempo and Loki (see section 4)
 ```
 
-Wait for PostgreSQL and Redis health checks and for both apps to start. The Go service starts its readiness endpoint even if Redis is temporarily unavailable; it remains unready until Redis responds. The Python readiness endpoint checks PostgreSQL and the Go gRPC channel.
-
-Issue a token:
+Issue a token yourself:
 
 ```bash
 curl -sS -X POST http://localhost:8000/token \
-  -H 'Content-Type: application/json' \
-  -d '{"user_email":"alice@example.com"}' | jq
+  -H 'Content-Type: application/json' -d '{"user_email":"alice@example.com"}'
+# {"token":"<64 hex chars>","permissions":["read:data","write:data"],"expires_in":3600}
 ```
 
-Expected shape (the token value is generated, so it will differ):
+The seed users are `alice@example.com` (`read:data`, `write:data`) and `bob@example.com` (`admin:users`,
+`read:data`).
 
-```json
-{
-  "token": "<64-character-hex-token>",
-  "permissions": ["read:data", "write:data"],
-  "expires_in": 3600
-}
-```
-
-Seed users: `alice@example.com` has `read:data` and `write:data`; `bob@example.com` has `admin:users` and `read:data`. Unknown users return 404. Invalid input returns 422. Dependency failures map to 503/504 instead of leaking stack traces or returning misleading success responses.
-
-Useful endpoints:
-
-| Endpoint | Purpose |
+| URL | Purpose |
 |---|---|
-| `http://localhost:8000/health/live` | Python process liveness |
-| `http://localhost:8000/health/ready` | Python readiness (PostgreSQL + Go gRPC) |
-| `http://localhost:8000/metrics` | Python Prometheus metrics |
-| `http://localhost:9090/health/live` | Go process liveness |
-| `http://localhost:9090/health/ready` | Go readiness (Redis ping) |
-| `http://localhost:9090/metrics` | Go Prometheus metrics |
-| `http://localhost:9091` | Prometheus UI |
-| `http://localhost:3000` | Grafana UI (credentials from `.env`) |
-| `http://localhost:3200` | Tempo HTTP API |
-| `http://localhost:3100/ready` | Loki readiness endpoint |
+| `http://localhost:8000/health/live`, `/health/ready`, `/metrics` | Python liveness, readiness (PostgreSQL and the gRPC channel) and metrics |
+| `http://localhost:9090/health/live`, `/health/ready`, `/metrics` | Go liveness, readiness (Redis ping) and metrics |
+| `http://localhost:3000` | Grafana (`admin` / `GRAFANA_ADMIN_PASSWORD`). Dashboard: **SRE → SRE - Token Platform Health** |
+| `http://localhost:9091` | Prometheus (targets, rules, alerts) |
+| `http://localhost:9093` | Alertmanager |
+| `http://localhost:3100`, `http://localhost:3200` | Loki and Tempo HTTP APIs |
 
-The Grafana dashboard is provisioned automatically under **Dashboards → SRE → SRE - Token Platform Health**.
+Stop the stack with `docker compose down`, or add `--volumes` to also delete the data.
 
-## 4. Demonstrate observability
+## 4. Observability walkthrough (the demo)
 
-### Metrics
+**One command proves correlation:** `./scripts/validate-observability.sh` generates its own W3C
+`traceparent`, issues a token with it, and then requires two things:
 
-Prometheus scrapes every 15 seconds. The Grafana dashboard includes Python API rate and 5xx ratio, p50/p95 HTTP latency, Go gRPC request rate by method/status, PostgreSQL pool utilisation and acquisition latency, Redis operation p95, Redis pool timeouts, token outcomes, Redis database key count and database query errors.
-
-You can also query Prometheus directly:
-
-```promql
-sum by (route) (rate(http_server_requests_total{job="python-token-service"}[5m]))
-
-sum(rate(http_server_requests_total{job="python-token-service",status_code=~"5.."}[5m]))
-/
-clamp_min(sum(rate(http_server_requests_total{job="python-token-service"}[5m])), 0.001)
-
-histogram_quantile(0.95,
-  sum by (le) (rate(http_server_request_duration_seconds_bucket{job="python-token-service"}[5m])))
-
-db_pool_connections_in_use / db_pool_connections_max
-
-histogram_quantile(0.95,
-  sum by (le, operation) (rate(redis_operation_duration_seconds_bucket{job="go-token-service"}[5m])))
-```
-
-### Logs and request correlation
-
-Generate a new request using the `curl` command above. In Grafana → Explore → Loki, query:
+1. Tempo returns that trace, containing both services and the `redis.set`, `redis.xadd` and `audit.process` spans.
+2. A single Loki query returns log lines from **both** services for that trace ID:
 
 ```logql
-{service_name="python-token-service"} |= "token_issued"
-{service_name="go-token-service"} |= "token_minted"
+{service_name=~"python-token-service|go-token-service"} | trace_id="<trace-id>"
 ```
 
-Open the Python request log and copy its `trace_id`. Search that exact trace ID in both services using Loki structured metadata filters, for example `{service_name="python-token-service"} | trace_id="<trace-id>"` and `{service_name="go-token-service"} | trace_id="<trace-id>"`. The request should correlate with the Go service log. Never log the raw token or email address.
+**In Grafana:**
 
-### End-to-end trace
+- **Explore → Loki**: run the query above, expand a log line and use the **TraceID** link to open the trace in Tempo.
+- **Explore → Tempo**: search for service `python-token-service`. The trace shows FastAPI → PostgreSQL query →
+  gRPC client → Go `MintToken` → `redis.set` → `redis.xadd`, followed by the asynchronous `audit.process` →
+  `redis.xack`. Click **Logs for this span** to get the Loki lines for both services.
+- **Dashboard** (the header links jump to Explore):
+  - Python HTTP RED: rate, 5xx ratio, p50/p95.
+  - Go gRPC RED: rate, server-error ratio, p50/p95.
+  - The 1-hour availability SLI against the 99.9% target.
+  - PostgreSQL pool: utilisation, acquire latency, errors.
+  - Redis: command p95, pool timeouts, keys, and per-pod `redis_up` and role from `redis_exporter`.
+  - Audit queue: depth (lag + pending), oldest pending age, processing p95, throughput.
 
-In Grafana → Explore → Tempo, search by service `python-token-service`, or use the trace ID from a Python request log. A successful request should show the FastAPI server span, PostgreSQL query/client span, gRPC client and Go server spans, and Redis `SET` span. If the spans are missing, check that both app containers have `OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317`, the Collector is healthy, and its Tempo/Loki exporters can reach their backends.
+Key metrics:
 
-## 5. Deploy to Kubernetes
+| Signal | Metric |
+|---|---|
+| HTTP RED | `http_server_requests_total{method,route,status_code}`, `http_server_request_duration_seconds` |
+| gRPC RED | `grpc_server_requests_total{method,status}`, `grpc_server_request_duration_seconds` |
+| DB pool | `db_pool_connections_in_use`, `db_pool_connections_max`, `db_pool_acquire_duration_seconds`, `db_pool_acquire_errors_total` |
+| Redis client | `redis_operations_total{operation,status}`, `redis_operation_duration_seconds`, `redis_pool_timeouts_total` |
+| **Queue depth** | `redis_stream_length`, `redis_stream_lag_messages` (not yet delivered), `redis_stream_pending_messages` (delivered, not yet acked), `redis_stream_oldest_pending_age_seconds` |
+| **Queue processing time** | `queue_message_processing_duration_seconds`, `queue_messages_processed_total{status}` |
 
-The manifests use Kustomize in `k8s/base`. Generated ConfigMaps read the checked-in copies under `k8s/base/config-files`; run `./scripts/sync-k8s-config.sh` after changing the canonical configs under `observability/` or `database/`. They assume a cluster with a default StorageClass, a metrics-server for HPA, a CNI that enforces NetworkPolicies, and (for external HTTP access) an Ingress controller in namespace `ingress-nginx`.
+Alerting uses recording rules plus multi-window burn-rate alerts for the 99.9% SLO: a fast burn is 14.4× over
+1 h and 5 m, and a slow burn is 6× over 6 h and 30 m. It also has latency alerts, `absent()` alerts for missing
+targets, dependency alerts (DB pool, CNPG, Redis), queue backlog and stall alerts, and Collector export
+failures. The rules are unit-tested in `observability/prometheus/alert-rules.test.yml`. See
+[docs/OPERATIONS.md](docs/OPERATIONS.md) for thresholds and runbooks.
 
-1. Build and push images to a registry reachable by the cluster. Replace `ghcr.io/your-org` in the manifests / `k8s/base/kustomization.yaml` with your registry and version.
+## 5. Run on Kubernetes
+
+### One-command local cluster (kind)
+
+Prerequisites: Docker, [kind](https://kind.sigs.k8s.io/) 0.24 or later (its default CNI enforces NetworkPolicy),
+`kubectl` and `openssl`.
 
 ```bash
-docker build -t ghcr.io/your-org/sre-python-service:1.0.0 ./python-service
-docker build -t ghcr.io/your-org/sre-go-service:1.0.0 ./golang-service
-docker push ghcr.io/your-org/sre-python-service:1.0.0
-docker push ghcr.io/your-org/sre-go-service:1.0.0
+./scripts/kind-e2e.sh                 # KEEP_CLUSTER=1 ./scripts/kind-e2e.sh keeps the cluster afterwards
 ```
 
-2. Create the namespace and a real Secret. Do not commit the resulting `k8s/secrets.yaml`.
+The script does the following:
+
+1. Creates the cluster, builds both images and loads them into kind.
+2. Installs CloudNativePG, creates the secrets and applies `k8s/overlays/dev`.
+3. Waits for PostgreSQL and every workload.
+4. Runs the smoke test and the trace/log validation, then checks that every Prometheus target is up and an
+   Alertmanager is discovered.
+5. Runs a Redis failover drill: it hangs the primary for 20 s, requires Sentinel to promote a replica, issues
+   tokens again, and checks that the old primary rejoins as a replica.
+
+### Step by step (any cluster)
 
 ```bash
-kubectl apply -f k8s/base/namespace.yaml
-cp k8s/secrets.example.yaml k8s/secrets.yaml
-# Replace all placeholder passwords with separate URL-safe random secrets (e.g. openssl rand -hex 32).
-kubectl apply -f k8s/secrets.yaml
+# 1. Images: build, push, and set the tag in the overlay (`images:` in k8s/overlays/<env>/kustomization.yaml)
+docker build -t ghcr.io/your-org/sre-python-service:1.0.0 python-service
+docker build -t ghcr.io/your-org/sre-go-service:1.0.0 golang-service
+
+# 2. Operator and secrets
+./scripts/install-cnpg.sh
+./scripts/create-k8s-secrets.sh sre-platform-dev
+
+# 3. Apply. The platform reads ../../observability, hence the load restrictor flag.
+kubectl kustomize --load-restrictor LoadRestrictionsNone k8s/overlays/dev | kubectl apply --server-side -f -
+kubectl -n sre-platform-dev get cluster,pods,svc,hpa
+
+# 4. Access
+kubectl -n sre-platform-dev port-forward svc/python-service 8000:8000 &
+kubectl -n sre-platform-dev port-forward svc/grafana 3000:3000 &
+./scripts/smoke-test.sh
 ```
 
-3. Apply the platform.
+The cluster needs a default StorageClass, metrics-server for the HPAs, and a CNI that enforces NetworkPolicy.
+For external access, add an Ingress or Gateway with TLS in the `ingress-nginx` namespace, which the
+NetworkPolicies already allow.
 
-```bash
-kubectl apply -k k8s/base
-kubectl -n sre-platform get pods,svc,pvc,hpa
-kubectl -n sre-platform get events --sort-by=.lastTimestamp
-```
-
-4. Port-forward for the demo:
-
-```bash
-kubectl -n sre-platform port-forward svc/python-service 8000:8000
-kubectl -n sre-platform port-forward svc/grafana 3000:3000
-kubectl -n sre-platform port-forward svc/prometheus 9091:9090
-```
-
-Run the same `curl` request against `http://localhost:8000/token`. Grafana admin credentials come from the Secret. The manifests provide internal Services; an HTTPS Ingress / Gateway and certificate are intentionally environment-specific and must be configured before public exposure.
-
-**Image loading with kind:** when using a local kind cluster rather than a registry, build the two images locally and run `kind load docker-image ... --name <cluster>` for both image tags; use `imagePullPolicy: IfNotPresent` as configured.
+**Argo CD:** apply `k8s/argocd-application.example.yaml` after changing `repoURL`, and set
+`kustomize.buildOptions: --load-restrictor LoadRestrictionsNone` in `argocd-cm` (this is a repo-server
+setting, not an Application field). Dev and staging self-heal. Production syncs manually, from an image tag
+promoted by CI.
 
 ## 6. Tests and CI
 
 ```bash
-cd python-service
-python -m pip install -r requirements-dev.txt
-pytest -q
-cd ../golang-service
-go test ./...
-go vet ./...
+make test             # Python pytest + Go gofmt/vet/race tests (miniredis-backed queue tests)
+make validate-config  # promtool config/rules/rule tests, amtool, otelcol validate
+make k8s-validate     # render every Kustomize root + kubeconform -strict with CNPG/Argo CD CRD schemas
+make kind-e2e         # full Kubernetes end-to-end (section 5)
 ```
 
-The GitHub Actions workflow runs unit tests, Go vet, Docker builds, Compose integration smoke tests, Kustomize/kubeconform validation and filesystem vulnerability scanning. Container publication, SBOM, signing and live cluster tests require repository and platform credentials.
+`.github/workflows/ci.yml` runs these jobs:
 
-## 7. Additional SRE hardening
+| Job | What it checks |
+|---|---|
+| `python`, `golang` | Unit tests, `go mod tidy -diff`, gofmt, vet, race tests |
+| `observability-config` | Every config, validated with the same Prometheus, Alertmanager and Collector images the stack deploys |
+| `k8s-validation` | Strict schema validation of every Kustomize root |
+| `containers` | hadolint, image build and a Trivy image scan for each service |
+| `integration` | Compose up, smoke test, and Tempo + Loki correlation |
+| `kind-e2e` | The kind end-to-end and failover test |
+| `security` | Trivy filesystem and dependency scan |
 
-The implementation now includes the following review improvements:
+## 7. Design decisions (summary)
 
-- **Independent deployment roots:** `k8s/apps/python-service`, `k8s/apps/go-service`, and `k8s/platform` provide separate Kustomize reconciliation units. The Argo CD example uses separate Applications. The legacy `k8s/base` remains a convenient whole-platform demo deployment.
-- **ConfigMap rollouts:** generated ConfigMaps use content-hash suffixes. Python or observability configuration changes can therefore update the relevant Pod template without disabling Kustomize's normal rollout behaviour.
-- **Pod placement:** Python and Go Deployments include preferred zone/node topology spreading and pod anti-affinity. These are soft defaults; production clusters should add failure-domain capacity and, if required, a hard zone policy.
-- **Network isolation:** the namespace uses default-deny ingress and egress policies with explicit application, DNS, Prometheus, OTLP, PostgreSQL, Redis and telemetry-backend flows. Test the rules against the actual CNI.
-- **Redis infrastructure telemetry:** a Redis exporter is included in Compose and Kubernetes, and Prometheus scrapes it in both environments.
-- **Optional gRPC mTLS:** Python and Go support certificate-based TLS when `GRPC_TLS_*` values and mounted certificates are configured. The local demo remains plaintext for compatibility. Production should require mTLS or an approved service-mesh identity model.
-- **Release validation:** CI validates Kustomize rendering and Kubernetes schemas, in addition to Python tests, Go tests/vet and container builds.
+Full reasoning is in [docs/DESIGN_DECISIONS.md](docs/DESIGN_DECISIONS.md).
 
-Remaining production work is explicitly documented rather than hidden:
+- **Prometheus + Loki + Tempo + Grafana behind one OTel Collector.** It is open source, runs the same in
+  Compose and Kubernetes, and Grafana links all three natively. The applications only speak OTLP.
+- **Redis Stream for the audit queue.** Consumer groups, acknowledgements, pending-entry tracking and replay
+  give measurable depth (lag + pending), oldest-message age and processing time. A Redis List would need
+  hand-written acknowledgement and retry logic.
+- **Sanitised manual Redis spans.** Only the operation name is recorded, never keys or values, which contain
+  tokens.
+- **Readiness, not liveness, reflects dependencies.** A PostgreSQL or Redis outage removes pods from
+  endpoints instead of restart-looping them.
+- **Fail closed on TLS misconfiguration.** If `GRPC_TLS_*` is set but the certificates are invalid, the Go
+  service exits rather than silently serving plaintext. With no TLS settings it runs the local plaintext demo
+  and logs `grpc_transport=plaintext_demo` at startup.
+- **Kustomize over Helm.** The rendered output stays inspectable for a small two-service platform. Generated
+  ConfigMaps carry content hashes, so a config change rolls out the pods that use it.
+- **No service mesh.** Istio or Linkerd would add sidecars and an operational burden that this two-service
+  system doesn't need. mTLS is supported at the application level instead.
 
-- **HA PostgreSQL:** install CloudNativePG with `make cnpg-install`, create `k8s/secrets.yaml`, and apply `k8s/platform`. The application uses the generated `postgres-rw` Service.
-- **HA Redis:** the platform creates three Redis data Pods and three Sentinel Pods. The Go service resolves the Sentinel primary during startup and reconnects on failover.
-- **GitOps environments:** `k8s/overlays/dev`, `staging`, and `production` provide environment-specific namespaces, replica counts, and image tags. `k8s/argocd-application.example.yaml` contains corresponding Argo CD Applications.
-- **Database migrations:** `k8s/base/database-migration.yaml` runs `001_initial.sql` as a controlled Job before application rollout validation.
-- **Alert delivery:** Prometheus sends firing alerts to Alertmanager. Replace the placeholder webhook in `observability/alertmanager/alertmanager.yml` with the approved notification integration.
+## 8. Production readiness: what remains
 
-Remaining production work:
+These require real infrastructure or organisational decisions, and are not missing code:
 
-- Obtain and configure CloudNativePG, backup object storage, restore credentials and retention.
-- Test PostgreSQL switchover/failover and Redis Sentinel promotion.
-- Integrate an external secret manager and workload certificates for production mTLS.
-- Replace provisional notification routing and load-test HPA/connection budgets.
+- CloudNativePG backups to object storage with PITR, restore drills, and Redis persistence and memory policy
+  sized from load tests.
+- Mandatory mTLS between Python and Go with workload certificates and rotation, plus an external secret manager.
+- A real notification route: replace the `example.invalid` webhook in
+  `observability/alertmanager/alertmanager.yml`, then test a page end to end.
+- Ingress or Gateway with TLS, authentication and rate limiting; images pinned by digest, signed, with SBOM
+  and provenance.
+- Load tests to validate HPA thresholds, pool sizes (pods × `DB_POOL_MAX` against `max_connections`) and
+  SLO targets.
+- Observability backends in HA/microservices mode with object storage, retention and a trace sampling policy.
 
-## 8. Important design decisions and limitations
-
-- **Loki + Tempo + Prometheus:** open-source, local Compose friendly, and natively connected in Grafana. CloudWatch / managed observability is a sensible alternative in an AWS-only environment; see `docs/DESIGN_DECISIONS.md`.
-- **One OpenTelemetry Collector:** centralises OTLP receiving, batching and exporting so applications do not need backend-specific code. The demo runs one Collector replica; production should use a scalable Deployment/DaemonSet topology with memory limits, persistent/retry queues where appropriate, and Collector self-monitoring.
-- **PostgreSQL pooling:** the Python service reuses a bounded `ThreadedConnectionPool`; it does not establish a new database connection per API request. Pool size must be sized across all replicas against PostgreSQL `max_connections` and other clients.
-- **gRPC channel reuse and deadlines:** the channel is created once per Python process and closed on shutdown. Each RPC has a finite timeout to prevent unbounded request/thread occupancy.
-- **Redis is not a queue in this starter:** it is an expiring key/value token store. Therefore the code instruments real Redis command rate, errors, duration and DB key count. A “queue depth” gauge would be fabricated today. If a Redis list/stream or worker queue is added, implement `LLEN`/`XLEN`, consumer throughput, oldest-message age and processing duration for the actual queue.
-- **Kubernetes data stores:** PostgreSQL uses CloudNativePG with three instances and Redis uses a three-node Redis/Sentinel topology. They still require operator installation, object-store backups, restore drills and production connection/capacity validation.
-- **Secrets:** `k8s/secrets.example.yaml` is a template only. Use an external secret manager / CSI driver or External Secrets Operator, encryption at rest and rotation in production.
-
-See `docs/ASSIGNMENT_COVERAGE.md`, `docs/IMPLEMENTATION_SUMMARY.md`, `docs/DESIGN_DECISIONS.md`, `docs/OPERATIONS.md`, `docs/DEMO_AND_INTERVIEW.md` and `docs/VALIDATION.md` for requirement mapping, concrete code changes, trade-offs, alert thresholds, live-demo script and validation boundary.
-
-Before submission, run real PostgreSQL/Redis integration tests, gRPC contract tests and a Compose smoke test. For production mTLS, mount a CA and workload certificates into both gRPC Pods and set `GRPC_TLS_*` variables instead of using the local plaintext fallback.
-
-For submission, replace mutable tags with immutable digests and publish both images to an accessible registry. In CI, add SBOM generation, provenance signing and image signing before merging to a protected release branch.
+Further reading: [assignment coverage](docs/ASSIGNMENT_COVERAGE.md) ·
+[design decisions](docs/DESIGN_DECISIONS.md) · [operations and SLOs](docs/OPERATIONS.md) ·
+[demo guide](docs/DEMO_AND_INTERVIEW.md) · [validation record](docs/VALIDATION.md)

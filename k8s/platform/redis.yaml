@@ -1,0 +1,220 @@
+# Redis primary/replicas + Sentinel quorum (3 + 3).
+# Both sides announce stable pod hostnames (redis-N.redis, redis-sentinel-N.redis-sentinel) instead of
+# pod IPs, so a restarted pod can recognise itself and failover state survives pod IP changes.
+# Bootstrap order: ask the Sentinels for the current primary; only if none answers is redis-0 primary.
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: sre-platform
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/path: /metrics
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: {app: redis}
+  ports:
+    - {name: redis, port: 6379, targetPort: redis}
+    - {name: metrics, port: 9121, targetPort: metrics}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: sre-platform
+spec:
+  serviceName: redis
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: {app: redis}
+  template:
+    metadata:
+      labels: {app: redis}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile: {type: RuntimeDefault}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels: {app: redis}
+      containers:
+        - name: redis
+          image: redis:7.4-alpine
+          command: ["sh", "-ec"]
+          args:
+            - |
+              self="$(hostname).redis"
+              primary=""
+              for attempt in $(seq 1 10); do
+                primary="$(redis-cli -t 2 -h redis-sentinel -p 26379 --raw sentinel get-master-addr-by-name mymaster 2>/dev/null | head -n 1 || true)"
+                [ -n "$primary" ] && break
+                sleep 1
+              done
+              primary="${primary:-redis-0.redis}"
+              set -- --appendonly yes --dir /data --replica-announce-ip "$self" \
+                --requirepass "$REDIS_PASSWORD" --masterauth "$REDIS_PASSWORD"
+              [ "$primary" = "$self" ] || set -- "$@" --replicaof "$primary" 6379
+              echo "starting as $([ "$primary" = "$self" ] && echo primary || echo "replica of $primary")"
+              exec redis-server "$@"
+          ports: [{name: redis, containerPort: 6379}]
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom: {secretKeyRef: {name: platform-secrets, key: REDIS_PASSWORD}}
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "REDISCLI_AUTH=\"$REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "REDISCLI_AUTH=\"$REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 3
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 512Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: redis-data, mountPath: /data}
+        # One exporter per Redis pod keeps role/replication metrics correct after a failover.
+        - name: redis-exporter
+          image: oliver006/redis_exporter:v1.67.4
+          args: ["--redis.addr=redis://localhost:6379"]
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom: {secretKeyRef: {name: platform-secrets, key: REDIS_PASSWORD}}
+          ports: [{name: metrics, containerPort: 9121}]
+          resources:
+            requests: {cpu: 20m, memory: 32Mi}
+            limits: {cpu: 100m, memory: 64Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+  volumeClaimTemplates:
+    - metadata: {name: redis-data}
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: 2Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-sentinel
+  namespace: sre-platform
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: {app: redis-sentinel}
+  ports: [{name: sentinel, port: 26379, targetPort: sentinel}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis-sentinel
+  namespace: sre-platform
+spec:
+  serviceName: redis-sentinel
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: {app: redis-sentinel}
+  template:
+    metadata:
+      labels: {app: redis-sentinel}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile: {type: RuntimeDefault}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels: {app: redis-sentinel}
+      containers:
+        - name: sentinel
+          image: redis:7.4-alpine
+          command: ["sh", "-ec"]
+          args:
+            - |
+              self="$(hostname).redis-sentinel"
+              primary=""
+              for peer in redis-sentinel-0 redis-sentinel-1 redis-sentinel-2; do
+                [ "$peer.redis-sentinel" = "$self" ] && continue
+                primary="$(redis-cli -t 2 -h "$peer.redis-sentinel" -p 26379 --raw sentinel get-master-addr-by-name mymaster 2>/dev/null | head -n 1 || true)"
+                [ -n "$primary" ] && break
+              done
+              primary="${primary:-redis-0.redis}"
+              for attempt in $(seq 1 60); do
+                REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli -t 2 -h "$primary" ping 2>/dev/null | grep -q PONG && break
+                sleep 2
+              done
+              # Sentinel rewrites its config file, so it lives on the writable /data volume.
+              cat >/data/sentinel.conf <<EOF
+              port 26379
+              sentinel resolve-hostnames yes
+              sentinel announce-hostnames yes
+              sentinel announce-ip $self
+              sentinel monitor mymaster $primary 6379 2
+              sentinel auth-pass mymaster $REDIS_PASSWORD
+              sentinel down-after-milliseconds mymaster 5000
+              sentinel failover-timeout mymaster 10000
+              sentinel parallel-syncs mymaster 1
+              EOF
+              echo "monitoring primary $primary"
+              exec redis-sentinel /data/sentinel.conf
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom: {secretKeyRef: {name: platform-secrets, key: REDIS_PASSWORD}}
+          ports: [{name: sentinel, containerPort: 26379}]
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "redis-cli -p 26379 ping | grep -q PONG"]
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 200m, memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+      volumes:
+        - {name: data, emptyDir: {sizeLimit: 16Mi}}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: redis
+  namespace: sre-platform
+spec:
+  maxUnavailable: 1
+  selector: {matchLabels: {app: redis}}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: redis-sentinel
+  namespace: sre-platform
+spec:
+  maxUnavailable: 1
+  selector: {matchLabels: {app: redis-sentinel}}
