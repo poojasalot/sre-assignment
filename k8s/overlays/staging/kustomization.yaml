@@ -11,6 +11,7 @@ images:
   - {name: ghcr.io/your-org/sre-python-service, newTag: 1.0.0}
   - {name: ghcr.io/your-org/sre-go-service, newTag: 1.0.0}
 patches:
+  - path: resources.yaml
   - target: {kind: ConfigMap, name: platform-config}
     patch: |-
       - {op: replace, path: /data/DEPLOYMENT_ENVIRONMENT, value: staging}

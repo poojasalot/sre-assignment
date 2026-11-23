@@ -95,8 +95,10 @@ For a real identity service, do not use the demo's random hex token format as a 
   them, so the e2e run exercises these policies.
 - **Prometheus RBAC is a namespaced Role.** Service discovery is limited to its own namespace
   (`own_namespace: true`), so environments sharing a cluster cannot see each other.
-- **Dev runs on a single node.** The dev overlay relaxes required anti-affinity and runs one PostgreSQL
-  instance. Staging and production keep the HA topology.
+- **Environment overlays own sizing.** Dev has the smallest CPU/memory profile and an app HPA ceiling of 3;
+  staging has an intermediate profile and ceiling of 5; production keeps the shared base sizing and raises
+  the app HPA floor to 3. Dev also relaxes required anti-affinity and runs one PostgreSQL instance; staging
+  and production keep the HA topology.
 
 ## 7. Bonus scope
 

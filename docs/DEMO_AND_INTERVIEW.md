@@ -48,8 +48,9 @@ consumer reclaims a crashed pod's unacknowledged messages after 30 seconds.
 
 Show `scripts/kind-e2e.sh`: it deploys the dev overlay to kind with default-deny NetworkPolicies enforced and
 runs a Redis failover drill. Then show the Dockerfiles, probes and resources, ConfigMap and Secret separation,
-HPA, PDB and NetworkPolicies. PostgreSQL uses CloudNativePG and Redis uses Sentinel. Production still needs
-backups, restore drills and a real notification route.
+HPA, PDB and NetworkPolicies. Dev uses the smallest resource profile, staging uses an intermediate profile,
+and production retains the shared base sizing. PostgreSQL uses CloudNativePG and Redis uses Sentinel.
+Production still needs backups, restore drills and a real notification route.
 
 ## 2. 90-second design explanation
 
@@ -93,6 +94,7 @@ Define the RTO/RPO and consistency requirements first. Decide if token validity/
 - Prometheus/Grafana latency percentile panels require sufficient request observations.
 - The audit queue is a deliberate addition. The starter had no queue, so "queue depth" needed a real queue to measure. Publishing is best-effort, so a queue problem never blocks token issuance.
 - Queue depth gauges are read from Redis at scrape time and are group-wide, so dashboards use `max()` across replicas, not `sum()`.
-- The Compose integration test and the kind end-to-end test are in CI but had not been run locally when this was written (no Docker). Say so if asked, and show the CI run instead.
+- Report the current results in [VALIDATION.md](VALIDATION.md); Compose and kind checks are runtime tests and
+  should not be described as passing until they have actually completed.
 - Kubernetes HPAs need metrics-server. NetworkPolicies need a CNI that enforces them (kind's does). Access is by port-forward until an Ingress is added.
 - PostgreSQL and Redis HA is exercised by the kind end-to-end test. Backups and restore drills still need object storage and an agreed RPO/RTO.

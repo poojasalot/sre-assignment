@@ -1,94 +1,128 @@
-# Validation record
+# Validation guide and latest results
 
-This records what has actually been run, what only runs in CI, and what needs real infrastructure. Nothing
-is marked as passing unless it was executed.
+This guide separates checks that have passed from checks that still need to be run. Re-run the commands
+below after changes; a successful render or schema check does not replace runtime tests.
 
-## 1. Executed locally (no Docker available)
+## Latest execution results (2026-11-23)
 
-Tools were pinned under `.tools/` (gitignored): kubectl 1.37.2 (Kustomize 5.8.1), kubeconform 0.8.0,
-promtool 3.16.0, amtool 0.35.0, otelcol-contrib 0.165.0 and hadolint 2.14.0, with Go 1.27 and Python 3.13.
-
-| Check | Command | Result |
-|---|---|---|
-| Go formatting, vet, race tests | `make go-test` | Pass: 10 tests. They cover token mint and validate, the TLS fail-closed paths, audit consume with trace continuation, dead-consumer reclaim, the depth collector and oldest-age calculation. Queue tests run against miniredis. |
-| `go.mod` tidy | `go mod tidy -diff` | Pass |
-| Python unit tests | `make python-test` | Pass: 6 tests |
-| Prometheus configs | `promtool check config --syntax-only` (Compose and Kubernetes) | Pass |
-| Alert and recording rules | `promtool check rules` | Pass: 30 rules |
-| Alert rule unit tests | `promtool test rules` | Pass: a 5% error rate fires the fast burn, 404s do not burn budget, `absent()` alerts fire, and the stalled queue fires |
-| Alertmanager config | `amtool check-config` | Pass |
-| OTel Collector config | `otelcol-contrib validate` | Pass |
-| Grafana dashboard | JSON parse, plus all 29 panel expressions through `promtool check rules` | Pass |
-| Kustomize rendering | `make k8s-render`: platform, both apps, dev, staging and production | Pass. Dev renders namespace `sre-platform-dev` throughout, including the RoleBinding subject. It has 1 CNPG instance, `preferred` anti-affinity for Redis and Sentinel, HPA `minReplicas: 1`, and no `replicas` on the app Deployments. |
-| Kubernetes schemas | `make k8s-validate`: `kubeconform -strict` with the Kubernetes, CloudNativePG and Argo CD CRD schemas | Pass: 240 resources valid, 0 invalid, 0 skipped. This includes `k8s/argocd-application.example.yaml`. |
-| Dockerfile lint | `hadolint --failure-threshold error` | Pass. One pip-pinning warning remains, intentionally not gated. |
-| Shell scripts | `sh -n` and `bash -n` on every script | Pass |
-
-## 2. Wired into CI but not yet run
-
-These need Docker. They run in `.github/workflows/ci.yml` and have not run anywhere yet, so treat their first
-run as the real validation.
-
-| Check | Where | What it proves |
-|---|---|---|
-| Compose stack and smoke test | `integration` job | All services start healthy; token for alice, 404 for an unknown user |
-| Trace and log correlation | `integration` job, `scripts/validate-observability.sh` | One generated trace ID returns a Tempo trace with both services and the `redis.set`, `redis.xadd` and `audit.process` spans, and one Loki query returns logs from both services |
-| Image build, lint and scan | `containers` job | hadolint, build and a Trivy scan of both images |
-| kind end-to-end | `kind-e2e` job, `scripts/kind-e2e.sh` | See below |
-| Config validation with the deployed images | `observability-config` job | Same checks as section 1, using the exact Prometheus, Alertmanager and Collector images |
-
-What `scripts/kind-e2e.sh` asserts, in order:
-
-1. The dev overlay applies, the CloudNativePG cluster is Ready, and every workload rolls out. This exercises the
-   Sentinel writable volume, Redis bootstrap, Alertmanager storage and the generated ConfigMaps.
-2. The smoke test and the trace/log correlation pass inside the cluster.
-3. Every expected Prometheus job is up (`python-token-service`, `go-token-service`, `otel-collector`,
-   `redis-exporter`, `cnpg`, `prometheus`) and an Alertmanager is discovered.
-4. A Redis failover: the primary is paused for 20 s, Sentinel promotes a replica, tokens still mint, and the old
-   primary rejoins as a replica.
-
-Because kind's default CNI enforces NetworkPolicy, step 1 to 3 passing also validates the default-deny allowlists.
-
-### Known risks for the first run
-
-Static checks cannot confirm these, so check them first if the run fails:
-
-- **Probes under default-deny.** Kubelet probes come from the node, which most CNIs exempt. If kind's does not,
-  pods will never become Ready.
-- **CNPG instance manager.** Its egress to the Kubernetes API (ports 443 and 6443) must be allowed. The policy
-  allows both.
-- **Loki and Tempo ownership.** Their volumes are written by the image's own user, and their root
-  filesystems are left writable. Confirm they start under the pod security context.
-- **Resource sizing.** The full stack in a small Docker Desktop VM may not fit; give kind 6 GB or more.
-- **Tempo search.** `validate-observability.sh` fetches the trace by ID, which does not depend on search indexing.
-
-## 3. Not validated, needs real infrastructure
-
-| Item | Needed |
+| Check | Result |
 |---|---|
-| Notification delivery | A real Alertmanager receiver. The checked-in webhook is `https://example.invalid/...`. |
-| Backups and restore | Object storage for CloudNativePG, plus a restore drill. |
-| Multi-node and multi-zone behaviour | Required anti-affinity, PDBs and topology spread need a multi-node cluster. kind runs the single-node dev overlay. |
-| HPA scaling | metrics-server and load. |
-| mTLS | Workload certificates for the `GRPC_TLS_*` settings. Only the fail-closed error path is unit-tested. |
-| Argo CD sync | An Argo CD instance with `kustomize.buildOptions: --load-restrictor LoadRestrictionsNone`. Only schema validity is checked. |
-| Load and capacity | Load tests to set pool sizes, HPA thresholds, resource limits and the audit stream cap. |
+| Python and Go unit tests (`make test`) | Pass: 6 Python tests; Go formatting, vet and race tests pass. Python dependencies were installed into a temporary virtual environment. |
+| Go module tidy check (`go mod tidy -diff`) | Pass. |
+| Kustomize rendering and strict schemas (`make k8s-validate`) | Pass: 240 resources valid, 0 invalid, 0 skipped. Includes the platform, both app roots, all three overlays, CloudNativePG and Argo CD schemas. |
+| Compose YAML (`docker-compose config --quiet`) | Pass. |
+| Shell syntax and Grafana dashboard JSON | Pass. |
+| Prometheus configs and alert rules | Pass: both Prometheus configs, all 30 rules and the Prometheus rule unit tests. |
+| `make validate-config` | Prometheus checks and rule tests pass; the target stops at `amtool` because that executable is not installed. Alertmanager and OTel checks separately pass using the deployed container images (`amtool check-config` and `otelcol-contrib validate`). |
+| Compose image builds | Pass for both application images. |
+| Compose integration and observability correlation | Blocked: Docker refused bind mounts from this workspace under `Documents`; the isolated test project was removed afterward. The existing Compose project was left untouched. |
+| kind end-to-end / Redis failover | Failed before workload rollout: CloudNativePG and Kubernetes control-plane probes timed out while two kind clusters shared a Docker Engine with only 2 GiB available. The isolated test cluster was deleted; the existing `sre-token` cluster was preserved. |
+| Existing CNPG controller recovery | Pass: after deleting the extra test cluster, the controller stayed Ready with no new restarts for 60 seconds, and a server-side dry run through its admission webhook succeeded. |
 
-## 4. Reproduce
+
+The kind issue was resource contention, not a broken Kubernetes Service route: the existing kind node had
+2 GiB memory/2 CPUs, was using about 1.47 GiB, and the Kubernetes API Service had a valid endpoint. When the
+extra test cluster was removed, the existing CNPG controller recovered. `scripts/kind-e2e.sh` now fails fast
+below 6 GiB, refuses cluster-name collisions, refuses parallel kind clusters by default, and deletes only a
+cluster it created. Use `ALLOW_PARALLEL_KIND_CLUSTER=1` only when Docker has sufficient capacity.
+
+`make k8s-validate` creates the `rendered/` directory. It validates structure and schemas, not whether the
+resource requests/limits or HPA values are the desired ones. Dev and staging resource profiles are defined
+in their overlay `resources.yaml` files; production retains the shared base profile. Inspect the generated
+files in `rendered/` when reviewing effective values.
+
+## Prerequisites
+
+- Python 3, Go, and the Python development requirements.
+- `kubectl` and `kubeconform` for Kubernetes rendering/schema validation; network access is needed to fetch
+  external CRD schemas.
+- `promtool`, `amtool` and `otelcol-contrib` for `make validate-config`, or Docker with the validator images
+  from `.github/workflows/ci.yml`.
+- Docker Engine and Docker Compose for the Compose runtime flow.
+- Docker with at least 6 GiB available memory and 4 CPUs, kind 0.24+, kubectl and openssl for the kind end-to-end flow.
+  By default, no other kind cluster may be running.
+
+## Static checks
+
+Run these commands from the repository root:
 
 ```bash
-# Static checks (no Docker)
-make test
-make validate-config      # needs promtool, amtool, otelcol-contrib on PATH
-make k8s-validate         # needs kubectl and kubeconform on PATH
+# Create/activate a virtual environment and install test dependencies.
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r python-service/requirements-dev.txt
 
-# Runtime checks (Docker)
-cp .env.example .env      # replace every change-me-local-only value
-docker compose up --build -d --wait
+# Unit, formatting, static-analysis and dependency checks.
+make test
+(cd golang-service && go mod tidy -diff)
+
+# Observability configuration and dashboard.
+make validate-config
+python -m json.tool observability/grafana/dashboards/sre-token-platform.json >/dev/null
+
+# Render every Kustomize root and validate Kubernetes + CRD schemas.
+make k8s-validate
+```
+
+`make validate-config` runs Prometheus config/rule checks and rule tests, Alertmanager config validation,
+and OTel Collector validation. Install `amtool` and `otelcol-contrib` to run the Make target directly.
+Alternatively, follow the image-based commands in `.github/workflows/ci.yml`; Docker must be able to access
+the repository files. In this environment the checks were run with the deployed images by copying the
+individual config files into temporary containers, because Docker bind mounts from this workspace are
+blocked.
+
+## Compose runtime flow
+
+Use the Compose CLI available on your machine: the examples below use `docker compose`; substitute
+`docker-compose` if you have the standalone Compose executable. If Docker reports a bind-mount permission
+error, enable file sharing for the repository path in Docker Desktop before retrying.
+
+```bash
+docker compose config --quiet
+cp .env.example .env
+# Replace the example values in .env with unique local secrets.
+docker compose up --build -d --wait --wait-timeout 180
 ./scripts/smoke-test.sh
 ./scripts/validate-observability.sh
-docker compose down --volumes --remove-orphans
+docker compose down --remove-orphans
+```
 
-# Kubernetes (Docker + kind 0.24+)
+The smoke test checks Python liveness/readiness, token issuance for the seeded user and the expected 404 for
+an unknown user. The observability script sends a request with a generated W3C trace ID and verifies that
+Tempo contains the Python/Go/Redis/audit spans and Loki returns logs from both services for that ID.
+`docker compose down` keeps named volumes; add `--volumes` only when you intend to delete local data.
+
+## Kubernetes runtime flow
+
+```bash
 ./scripts/kind-e2e.sh
 ```
+
+This builds/loads the service images, installs CloudNativePG, creates dev secrets, deploys the dev overlay,
+waits for workloads, runs smoke and trace/log checks, checks Prometheus targets, and performs a Redis
+Sentinel failover drill. It requires at least 6 GiB and 4 CPUs available to Docker. The script refuses to reuse an
+existing cluster name and refuses to run beside another kind cluster unless explicitly opted in with
+`ALLOW_PARALLEL_KIND_CLUSTER=1`. It deletes only the test cluster it created; set `KEEP_CLUSTER=1` to keep
+that cluster after the run.
+
+For a manual dev deployment to an existing cluster:
+
+```bash
+./scripts/install-cnpg.sh
+./scripts/create-k8s-secrets.sh sre-platform-dev
+kubectl kustomize --load-restrictor LoadRestrictionsNone k8s/overlays/dev \
+  | kubectl apply --server-side -f -
+kubectl -n sre-platform-dev wait cluster.postgresql.cnpg.io/postgres \
+  --for=condition=Ready --timeout=10m
+kubectl -n sre-platform-dev get pods,svc,hpa
+```
+
+The cluster needs a StorageClass and a CNI that enforces NetworkPolicy. HPAs need metrics-server to report
+CPU metrics. The kind end-to-end script uses kind's NetworkPolicy-capable default CNI.
+
+## CI coverage
+
+`.github/workflows/ci.yml` runs Python tests, Go tidy/format/vet/race checks, observability config checks,
+strict Kustomize/schema validation, container lint/build/image scans, the Compose integration flow and the
+kind end-to-end/failover flow. Checks that have not completed locally should be reported as CI-only or
+not-yet-run, not as passing.

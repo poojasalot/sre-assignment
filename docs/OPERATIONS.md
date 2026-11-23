@@ -153,4 +153,6 @@ delivery end to end.
 - Go Redis client uses a pool size of 50 per Go process; with 10 replicas, potential client connections can approach 500. Validate against Redis `maxclients` and connection usage.
 - HPA CPU 70% is an initial scale trigger, not a performance SLO. Test burst, steady-state and failure-mode load. Scale on useful demand signals, but avoid autoscaling on a noisy latency metric that can create positive feedback.
 - Resource limits are starting values. Benchmark actual RSS/CPU and adjust after representative workload tests; OOMKills and throttling are operational signals.
+- Dev and staging override CPU/memory sizing in `k8s/overlays/<env>/resources.yaml`; production keeps the
+  shared base profile. Review the rendered overlay and re-size from measured load before promoting changes.
 - The audit stream holds at most about 10,000 entries. At sustained peak mint rate R per second, that covers roughly 10,000 / R seconds of consumer outage before unread events are trimmed. Size the cap from the measured peak rate.

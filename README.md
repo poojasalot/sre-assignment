@@ -6,11 +6,9 @@ Stream). Both services are containerised, deployable with Docker Compose or Kube
 Argo CD), and fully instrumented: RED and dependency metrics in Prometheus, JSON logs in Loki and
 distributed traces in Tempo, all correlated by trace ID in Grafana.
 
-> **Validation status.** Unit tests, Prometheus rule unit tests, every config file (Prometheus,
-> Alertmanager, OTel Collector, Grafana) and every Kustomize root (strict schema validation including the
-> CloudNativePG and Argo CD CRDs) pass locally. The Compose integration test and the kind end-to-end test
-> (`scripts/kind-e2e.sh`) are wired into CI but need Docker, which was not available where this revision
-> was prepared. See [docs/VALIDATION.md](docs/VALIDATION.md).
+> **Validation status.** Unit tests, strict Kustomize/schema validation (240 resources), Compose
+> configuration, shell syntax, dashboard JSON and observability config checks passed. 
+> See [docs/VALIDATION.md](docs/VALIDATION.md) for details and commands.
 
 ## 1. Architecture
 
@@ -74,7 +72,7 @@ flowchart TB
 |---|---|
 | `k8s/platform` | Namespace, `platform-config`, CloudNativePG cluster, Redis + Sentinel, observability stack, NetworkPolicies. ConfigMaps are generated from the canonical files in `observability/` and `database/`, so Compose and Kubernetes cannot drift. |
 | `k8s/apps/python-service`, `k8s/apps/go-service` | Each service's Deployment, Service, HPA and PDB. They can be reconciled independently. |
-| `k8s/overlays/{dev,staging,production}` | One namespace per environment, plus image tags and environment patches. The dev overlay runs a single-node topology (1 PostgreSQL instance, soft anti-affinity, `minReplicas: 1`). Production raises `minReplicas` to 3. |
+| `k8s/overlays/{dev,staging,production}` | One namespace per environment, plus image tags and environment patches. Dev and staging set lower CPU/memory requests and limits for apps, data stores and observability than the production base; dev uses the smallest profile. Dev also runs a single-node topology (1 PostgreSQL instance, soft anti-affinity) and caps app HPAs at 3 replicas; staging caps them at 5. Production retains the base resource sizing and raises `minReplicas` to 3. |
 | `k8s/argocd-application.example.yaml` | An AppProject plus one Application per environment. Dev and staging sync automatically. Production is manual. |
 
 Key Kubernetes behaviours:
@@ -178,7 +176,7 @@ Key metrics:
 | gRPC RED | `grpc_server_requests_total{method,status}`, `grpc_server_request_duration_seconds` |
 | DB pool | `db_pool_connections_in_use`, `db_pool_connections_max`, `db_pool_acquire_duration_seconds`, `db_pool_acquire_errors_total` |
 | Redis client | `redis_operations_total{operation,status}`, `redis_operation_duration_seconds`, `redis_pool_timeouts_total` |
-| **Queue depth** | `redis_stream_length`, `redis_stream_lag_messages` (not yet delivered), `redis_stream_pending_messages` (delivered, not yet acked), `redis_stream_oldest_pending_age_seconds` |
+| **Queue depth** | `redis_stream_length`, `redis_stream_lag_messages` (not yet delivered), `redis_stream_pending_messages` (delivered), `redis_stream_oldest_pending_age_seconds` |
 | **Queue processing time** | `queue_message_processing_duration_seconds`, `queue_messages_processed_total{status}` |
 
 Alerting uses recording rules plus multi-window burn-rate alerts for the 99.9% SLO: a fast burn is 14.4× over
@@ -191,11 +189,15 @@ failures. The rules are unit-tested in `observability/prometheus/alert-rules.tes
 
 ### One-command local cluster (kind)
 
-Prerequisites: Docker, [kind](https://kind.sigs.k8s.io/) 0.24 or later (its default CNI enforces NetworkPolicy),
-`kubectl` and `openssl`.
+Prerequisites: Docker Engine/VM with at least 6 GiB of memory and 4 CPUs, [kind](https://kind.sigs.k8s.io/) 0.24 or later
+(its default CNI enforces NetworkPolicy), `kubectl` and `openssl`. The script refuses to reuse an existing
+cluster and, by default, refuses to start while another kind cluster is running.
 
 ```bash
-./scripts/kind-e2e.sh                 # KEEP_CLUSTER=1 ./scripts/kind-e2e.sh keeps the cluster afterwards
+./scripts/kind-e2e.sh
+# Use only with enough Docker memory if another kind cluster must stay running:
+ALLOW_PARALLEL_KIND_CLUSTER=1 KIND_CLUSTER=sre-token-e2e ./scripts/kind-e2e.sh
+# KEEP_CLUSTER=1 keeps the newly-created test cluster afterwards.
 ```
 
 The script does the following:
@@ -240,11 +242,36 @@ promoted by CI.
 
 ## 6. Tests and CI
 
+Run Python tests in a virtual environment and then execute the static validation targets:
+
 ```bash
-make test             # Python pytest + Go gofmt/vet/race tests (miniredis-backed queue tests)
-make validate-config  # promtool config/rules/rule tests, amtool, otelcol validate
-make k8s-validate     # render every Kustomize root + kubeconform -strict with CNPG/Argo CD CRD schemas
-make kind-e2e         # full Kubernetes end-to-end (section 5)
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r python-service/requirements-dev.txt
+make test                         # Python tests + Go formatting, vet and race tests
+(cd golang-service && go mod tidy -diff)
+make validate-config              # needs promtool, amtool and otelcol-contrib on PATH
+python -m json.tool observability/grafana/dashboards/sre-token-platform.json >/dev/null
+make k8s-validate                  # renders every root; strict schemas include CNPG and Argo CD
+```
+
+For the runtime flows, first validate the Compose file, then start the stack and run the smoke and
+trace/log-correlation checks:
+
+```bash
+docker compose config --quiet       # use `docker-compose` instead if that is your installed command
+cp .env.example .env                 # replace the example values with local secrets
+docker compose up --build -d --wait --wait-timeout 180
+./scripts/smoke-test.sh
+./scripts/validate-observability.sh
+docker compose down --remove-orphans
+```
+
+For the full Kubernetes deployment and Redis failover test (requires Docker, kind 0.24+, kubectl and
+openssl):
+
+```bash
+make kind-e2e                       # creates and later deletes only its own kind cluster
 ```
 
 `.github/workflows/ci.yml` runs these jobs:

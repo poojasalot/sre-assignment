@@ -1,0 +1,169 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: go-token-service
+  namespace: sre-platform
+spec:
+  template:
+    spec:
+      containers:
+        - name: go-service
+          resources:
+            requests: {cpu: 75m, memory: 96Mi}
+            limits: {cpu: 500m, memory: 384Mi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: python-token-service
+  namespace: sre-platform
+spec:
+  template:
+    spec:
+      containers:
+        - name: python-service
+          resources:
+            requests: {cpu: 150m, memory: 192Mi}
+            limits: {cpu: 750m, memory: 512Mi}
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: postgres
+  namespace: sre-platform
+spec:
+  resources:
+    requests: {cpu: 200m, memory: 192Mi}
+    limits: {cpu: 750m, memory: 768Mi}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: go-token-service
+  namespace: sre-platform
+spec:
+  maxReplicas: 5
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: python-token-service
+  namespace: sre-platform
+spec:
+  maxReplicas: 5
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: sre-platform
+spec:
+  template:
+    spec:
+      containers:
+        - name: redis
+          resources:
+            requests: {cpu: 75m, memory: 96Mi}
+            limits: {cpu: 400m, memory: 384Mi}
+        - name: redis-exporter
+          resources:
+            requests: {cpu: 15m, memory: 24Mi}
+            limits: {cpu: 75m, memory: 48Mi}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis-sentinel
+  namespace: sre-platform
+spec:
+  template:
+    spec:
+      containers:
+        - name: sentinel
+          resources:
+            requests: {cpu: 40m, memory: 48Mi}
+            limits: {cpu: 150m, memory: 192Mi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+  namespace: sre-platform
+spec:
+  template:
+    spec:
+      containers:
+        - name: collector
+          resources:
+            requests: {cpu: 75m, memory: 96Mi}
+            limits: {cpu: 400m, memory: 384Mi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loki
+  namespace: sre-platform
+spec:
+  template:
+    spec:
+      containers:
+        - name: loki
+          resources:
+            requests: {cpu: 75m, memory: 192Mi}
+            limits: {cpu: 500m, memory: 768Mi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tempo
+  namespace: sre-platform
+spec:
+  template:
+    spec:
+      containers:
+        - name: tempo
+          resources:
+            requests: {cpu: 75m, memory: 192Mi}
+            limits: {cpu: 500m, memory: 768Mi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: sre-platform
+spec:
+  template:
+    spec:
+      containers:
+        - name: prometheus
+          resources:
+            requests: {cpu: 150m, memory: 384Mi}
+            limits: {cpu: 750m, memory: 1536Mi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager
+  namespace: sre-platform
+spec:
+  template:
+    spec:
+      containers:
+        - name: alertmanager
+          resources:
+            requests: {cpu: 40m, memory: 48Mi}
+            limits: {cpu: 150m, memory: 192Mi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: sre-platform
+spec:
+  template:
+    spec:
+      containers:
+        - name: grafana
+          resources:
+            requests: {cpu: 75m, memory: 192Mi}
+            limits: {cpu: 400m, memory: 512Mi}

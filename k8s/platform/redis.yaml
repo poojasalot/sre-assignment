@@ -90,7 +90,7 @@ spec:
             - {name: redis-data, mountPath: /data}
         # One exporter per Redis pod keeps role/replication metrics correct after a failover.
         - name: redis-exporter
-          image: oliver006/redis_exporter:v1.67.4
+          image: oliver006/redis_exporter:v1.98.0
           args: ["--redis.addr=redis://localhost:6379"]
           env:
             - name: REDIS_PASSWORD

@@ -5,6 +5,7 @@
 #   2. wait for PostgreSQL, Redis/Sentinel, observability stack and both services
 #   3. smoke test, trace/log correlation, Prometheus targets and Alertmanager wiring
 #   4. Redis failover: hang the primary, Sentinel promotes a replica, tokens still mint, old primary rejoins
+# Requires Docker with at least 6 GiB and 4 CPUs. Existing kind clusters are refused by default.
 # Usage: scripts/kind-e2e.sh            (KEEP_CLUSTER=1 to leave the cluster running afterwards)
 set -euo pipefail
 
@@ -16,10 +17,50 @@ GO_IMAGE="ghcr.io/your-org/sre-go-service:dev"
 cd "$ROOT"
 
 log() { printf '\n==> %s\n' "$*"; }
+ORIGINAL_CONTEXT=""
+if kubectl config current-context >/dev/null 2>&1; then
+  ORIGINAL_CONTEXT="$(kubectl config current-context)"
+fi
+
+existing_clusters="$(kind get clusters)"
+if printf '%s\n' "$existing_clusters" | grep -Fxq "$CLUSTER"; then
+  echo "kind cluster '$CLUSTER' already exists; choose a different KIND_CLUSTER. Existing clusters are never reused or deleted." >&2
+  exit 1
+fi
+if [ -n "$existing_clusters" ] && [ "${ALLOW_PARALLEL_KIND_CLUSTER:-0}" != "1" ]; then
+  printf 'Existing kind cluster(s) detected:\n%s\n' "$existing_clusters" >&2
+  echo "Stop them before this resource-intensive test, or set ALLOW_PARALLEL_KIND_CLUSTER=1 if Docker has enough capacity." >&2
+  exit 1
+fi
+
+docker_memory_bytes="$(docker info --format '{{.MemTotal}}')"
+if [[ ! "$docker_memory_bytes" =~ ^[0-9]+$ ]]; then
+  echo "Could not determine Docker Engine memory; refusing to start kind test." >&2
+  exit 1
+fi
+minimum_memory_bytes=$((6 * 1024 * 1024 * 1024))
+if (( docker_memory_bytes < minimum_memory_bytes )); then
+  printf 'Docker Engine has %s bytes of memory; kind-e2e requires at least 6 GiB for the full stack.\n' "$docker_memory_bytes" >&2
+  exit 1
+fi
+docker_cpu_count="$(docker info --format '{{.NCPU}}')"
+if [[ ! "$docker_cpu_count" =~ ^[0-9]+$ ]] || (( docker_cpu_count < 4 )); then
+  printf 'Docker Engine reports %s CPUs; kind-e2e requires at least 4 CPUs for the full stack.\n' "$docker_cpu_count" >&2
+  exit 1
+fi
+
 pids=()
+created_cluster=0
 cleanup() {
   for pid in "${pids[@]:-}"; do kill "$pid" 2>/dev/null || true; done
-  if [ "${KEEP_CLUSTER:-0}" != "1" ]; then kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true; fi
+  if [ "$created_cluster" = "1" ] && [ "${KEEP_CLUSTER:-0}" != "1" ]; then
+    kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
+    if [ -n "$ORIGINAL_CONTEXT" ] && kubectl config get-contexts "$ORIGINAL_CONTEXT" >/dev/null 2>&1; then
+      if ! kubectl config use-context "$ORIGINAL_CONTEXT" >/dev/null; then
+        echo "Could not restore kubectl context '$ORIGINAL_CONTEXT'." >&2
+      fi
+    fi
+  fi
 }
 on_error() {
   echo "e2e failed; recent state:" >&2
@@ -30,7 +71,8 @@ trap on_error ERR
 trap cleanup EXIT
 
 log "Create kind cluster $CLUSTER"
-kind get clusters | grep -qx "$CLUSTER" || kind create cluster --name "$CLUSTER" --wait 120s
+created_cluster=1
+kind create cluster --name "$CLUSTER" --wait 120s
 
 log "Build and load images"
 docker build -t "$PY_IMAGE" python-service
