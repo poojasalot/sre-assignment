@@ -11,7 +11,7 @@ env:
   # Config validators run from the same images the stack deploys, so CI checks the versions we ship.
   PROMETHEUS_IMAGE: prom/prometheus:v3.16.0
   ALERTMANAGER_IMAGE: prom/alertmanager:v0.28.1
-  OTELCOL_IMAGE: otel/opentelemetry-collector-contrib:0.165.1
+  OTELCOL_IMAGE: otel/opentelemetry-collector-contrib:0.165.0
   KUBECONFORM_VERSION: v0.8.0
 
 jobs:
